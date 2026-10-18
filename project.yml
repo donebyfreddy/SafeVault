@@ -1,0 +1,104 @@
+name: MyVault
+
+options:
+  bundleIdPrefix: com.federicomencuccini
+  deploymentTarget:
+    iOS: "18.0"
+    macOS: "15.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Set your Apple Developer team here (or in Xcode > Signing & Capabilities) to run on a real iPhone
+    # and to enable Face ID / Touch ID on the Mac.
+    DEVELOPMENT_TEAM: ""
+    # Your Dropbox app key, from https://www.dropbox.com/developers/apps (see README).
+    DROPBOX_APP_KEY: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+packages:
+  MyVaultKit:
+    path: Packages/MyVaultKit
+
+targets:
+  MyVault-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - path: App/Shared
+      - path: App/macOS
+        excludes: ["*.entitlements", "Info.plist"]
+      - path: Assets.xcassets
+    dependencies:
+      - package: MyVaultKit
+    entitlements:
+      path: App/macOS/MyVault.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.files.user-selected.read-write: true
+    info:
+      path: App/macOS/Info.plist
+      properties:
+        CFBundleDisplayName: SafeVault
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHumanReadableCopyright: Personal use
+        NSFaceIDUsageDescription: Unlock your vault without typing the master password.
+        DropboxAppKey: $(DROPBOX_APP_KEY)
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.myvault.backup
+            UTTypeDescription: SafeVault Backup
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [myvaultbackup]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.federicomencuccini.myvault
+        PRODUCT_NAME: SafeVault
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: NO
+
+  MyVault-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Shared
+      - path: App/iOS
+        excludes: ["Info.plist"]
+      - path: Assets.xcassets
+    dependencies:
+      - package: MyVaultKit
+    info:
+      path: App/iOS/Info.plist
+      properties:
+        CFBundleDisplayName: SafeVault
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        ITSAppUsesNonExemptEncryption: false
+        NSFaceIDUsageDescription: Unlock your vault with Face ID instead of typing the master password.
+        DropboxAppKey: $(DROPBOX_APP_KEY)
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.myvault.backup
+            UTTypeDescription: SafeVault Backup
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [myvaultbackup]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.federicomencuccini.myvault
+        PRODUCT_NAME: SafeVault
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
