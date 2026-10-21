@@ -64,6 +64,18 @@ public struct ItemSnapshot: Codable, Hashable, Sendable {
 }
 
 public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
+    /// Several lists of old versions merged into one, newest first, without repeats. Two entries count as the
+    /// same version when they were saved within a millisecond of each other and hold the same name and fields.
+    public static func mergedHistory(_ lists: [ItemSnapshot]...) -> [ItemSnapshot] {
+        var result = [ItemSnapshot]()
+        for snap in lists.flatMap({ $0 }).sorted(by: { $0.savedAt > $1.savedAt }) {
+            if !result.contains(where: { abs($0.savedAt.timeIntervalSince(snap.savedAt)) < 0.002 && $0.name == snap.name && $0.fields == snap.fields }) {
+                result.append(snap)
+            }
+        }
+        return Array(result.prefix(maxHistory))
+    }
+
     public var id: UUID
     public var kind: ItemKind
     public var name: String
@@ -82,6 +94,12 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
     public var lastUsedAt: Date?
     /// Tombstone: the item was deleted but the record is kept so the deletion syncs.
     public var deleted: Bool
+    /// Small PNG shown instead of the generic tile: the site's logo, or one you chose. Stored inside the vault.
+    public var icon: Data?
+    /// True when you picked the image yourself, so it is never replaced by the site's logo.
+    public var iconCustom: Bool?
+    /// When the site's logo was last looked for, so a site without one is not asked again and again.
+    public var iconCheckedAt: Date?
 
     public static let maxHistory = 20
 
@@ -102,7 +120,10 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
         createdAt: Date = Date(),
         modifiedAt: Date? = nil,
         lastUsedAt: Date? = nil,
-        deleted: Bool = false
+        deleted: Bool = false,
+        icon: Data? = nil,
+        iconCustom: Bool? = nil,
+        iconCheckedAt: Date? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -121,6 +142,9 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
         self.modifiedAt = modifiedAt ?? createdAt
         self.lastUsedAt = lastUsedAt
         self.deleted = deleted
+        self.icon = icon
+        self.iconCustom = iconCustom
+        self.iconCheckedAt = iconCheckedAt
     }
 
     // MARK: Convenience
@@ -186,7 +210,26 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
     }
 
     public mutating func appendHistory(_ snap: ItemSnapshot) {
+        // The same old version can reach us from two devices; keep it once.
+        guard !history.contains(where: { abs($0.savedAt.timeIntervalSince(snap.savedAt)) < 0.002 && $0.name == snap.name && $0.fields == snap.fields }) else { return }
         history.insert(snap, at: 0)
         if history.count > Self.maxHistory { history.removeLast(history.count - Self.maxHistory) }
     }
+}
+
+
+extension VaultItem {
+    private static let canonicalEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        // Whole milliseconds: a date that went through a file or the network may differ in the last bit.
+        e.dateEncodingStrategy = .custom { date, encoder in
+            var c = encoder.singleValueContainer()
+            try c.encode(Int64((date.timeIntervalSince1970 * 1000).rounded()))
+        }
+        return e
+    }()
+
+    /// Stable bytes for comparing two copies of an item, immune to tiny differences in stored dates.
+    var canonicalBytes: Data { (try? Self.canonicalEncoder.encode(self)) ?? Data() }
 }

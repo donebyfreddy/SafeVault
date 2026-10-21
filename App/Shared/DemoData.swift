@@ -123,6 +123,11 @@ enum DemoLaunch {
            let item = model.items.first(where: { $0.name.lowercased().hasPrefix(name.lowercased()) }) {
             model.selectedID = item.id
         }
+        if args.contains("--provider=google") {
+            model.provider = .googleDrive
+            model.googleLinked = false
+            model.syncStatus = .notConfigured
+        }
         if args.contains("--demo-lock") { model.lock() }
     }
 }

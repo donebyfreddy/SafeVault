@@ -127,7 +127,12 @@ public final class KeychainBiometricStore: BiometricKeyStore {
         q[kSecUseAuthenticationContext as String] = ctx
         q[kSecReturnAttributes as String] = true
         let status = SecItemCopyMatching(q as CFDictionary, nil)
-        return status == errSecSuccess || status == errSecInteractionNotAllowed
+        if status == errSecSuccess || status == errSecInteractionNotAllowed { return true }
+        #if os(macOS)
+        return legacyExists(vaultID)
+        #else
+        return false
+        #endif
     }
 
     public func store(key: Data, vaultID: UUID) throws {
@@ -141,10 +146,62 @@ public final class KeychainBiometricStore: BiometricKeyStore {
         q[kSecValueData as String] = key
         q[kSecAttrAccessControl as String] = access
         let status = SecItemAdd(q as CFDictionary, nil)
+        #if os(macOS)
+        // An ad-hoc signed Mac app (no Apple team) cannot use the biometric-protected keychain. Keep the key in
+        // the normal keychain instead and ask for Touch ID in the app before it is read.
+        if status == errSecMissingEntitlement { try storeLegacy(key: key, vaultID: vaultID); return }
+        #endif
         guard status == errSecSuccess else { throw KeychainError.status(status) }
     }
 
+    #if os(macOS)
+    private func legacyQuery(_ vaultID: UUID) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.myvault.biometric.legacy",
+            kSecAttrAccount as String: vaultID.uuidString.lowercased(),
+        ]
+    }
+
+    private func legacyExists(_ vaultID: UUID) -> Bool {
+        var q = legacyQuery(vaultID)
+        q[kSecReturnAttributes as String] = true
+        return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
+    }
+
+    private func storeLegacy(key: Data, vaultID: UUID) throws {
+        SecItemDelete(legacyQuery(vaultID) as CFDictionary)
+        var q = legacyQuery(vaultID)
+        q[kSecValueData as String] = key
+        let status = SecItemAdd(q as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+    }
+
+    private func loadLegacy(vaultID: UUID, reason: String) async throws -> Data {
+        let context = LAContext()
+        do {
+            _ = try await context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason)
+        } catch let error as LAError where [.userCancel, .appCancel, .systemCancel, .userFallback].contains(error.code) {
+            throw KeychainError.userCancelled
+        } catch {
+            throw KeychainError.biometryUnavailable
+        }
+        var q = legacyQuery(vaultID)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        guard status == errSecSuccess, let data = out as? Data else {
+            throw status == errSecItemNotFound ? KeychainError.notStored : KeychainError.status(status)
+        }
+        return data
+    }
+    #endif
+
     public func load(vaultID: UUID, reason: String) async throws -> Data {
+        #if os(macOS)
+        if legacyExists(vaultID) { return try await loadLegacy(vaultID: vaultID, reason: reason) }
+        #endif
         let q0 = query(vaultID)
         return try await Task.detached(priority: .userInitiated) {
             let ctx = LAContext()
@@ -168,5 +225,8 @@ public final class KeychainBiometricStore: BiometricKeyStore {
 
     public func remove(vaultID: UUID) {
         SecItemDelete(query(vaultID) as CFDictionary)
+        #if os(macOS)
+        SecItemDelete(legacyQuery(vaultID) as CFDictionary)
+        #endif
     }
 }

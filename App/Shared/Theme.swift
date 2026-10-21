@@ -200,7 +200,24 @@ private struct Brand {
     var hairline = false
 }
 
-private func brand(for name: String, kind: ItemKind) -> Brand {
+private final class BrandCache: @unchecked Sendable {
+    static let shared = BrandCache()
+    private var values = [String: Brand]()
+    private let lock = NSLock()
+
+    func brand(for name: String, kind: ItemKind) -> Brand {
+        let key = "\(kind.rawValue)|\(name)"
+        lock.lock(); defer { lock.unlock() }
+        if let hit = values[key] { return hit }
+        let made = makeBrand(for: name, kind: kind)
+        values[key] = made
+        return made
+    }
+}
+
+private func brand(for name: String, kind: ItemKind) -> Brand { BrandCache.shared.brand(for: name, kind: kind) }
+
+private func makeBrand(for name: String, kind: ItemKind) -> Brand {
     let n = name.lowercased()
     func has(_ s: String) -> Bool { n.contains(s) }
     switch kind {
@@ -234,12 +251,62 @@ private func brand(for name: String, kind: ItemKind) -> Brand {
     return Brand(background: Color(hex: c), glyph: .letter(letter))
 }
 
+#if canImport(UIKit)
+import UIKit
+private typealias PlatformImage = UIImage
+#else
+import AppKit
+private typealias PlatformImage = NSImage
+#endif
+
+/// Decoded logos, kept in memory so scrolling a long list does not decode a PNG per row per frame.
+private final class IconImageCache: @unchecked Sendable {
+    static let shared = IconImageCache()
+    private let cache = NSCache<NSData, PlatformImage>()
+
+    func image(for data: Data) -> PlatformImage? {
+        let key = data as NSData
+        if let hit = cache.object(forKey: key) { return hit }
+        guard let made = PlatformImage(data: data) else { return nil }
+        cache.setObject(made, forKey: key)
+        return made
+    }
+}
+
+private func logoImage(_ data: Data) -> Image? {
+    guard let image = IconImageCache.shared.image(for: data) else { return nil }
+    #if canImport(UIKit)
+    return Image(uiImage: image)
+    #else
+    return Image(nsImage: image)
+    #endif
+}
+
 struct ServiceTile: View {
     let name: String
     var kind: ItemKind = .login
+    /// The site's logo or the one you chose. Takes the place of the generic tile.
+    var icon: Data? = nil
     var size: CGFloat = 40
 
     var body: some View {
+        if let icon, let image = logoImage(icon) {
+            image
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .padding(size * 0.1)
+                .frame(width: size, height: size)
+                .background(Color.white, in: RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous).strokeBorder(VT.line))
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+                .accessibilityHidden(true)
+        } else {
+            genericTile
+        }
+    }
+
+    @ViewBuilder private var genericTile: some View {
         let b = brand(for: name, kind: kind)
         RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
             .fill(b.background)

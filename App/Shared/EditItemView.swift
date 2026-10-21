@@ -1,5 +1,9 @@
 import MyVaultKit
 import SwiftUI
+import UniformTypeIdentifiers
+#if os(iOS)
+import PhotosUI
+#endif
 
 struct EditItemView: View {
     @State var item: VaultItem
@@ -12,6 +16,11 @@ struct EditItemView: View {
     @State private var codesText: String
     @State private var tagsText: String
     @State private var shown = Set<UUID>()
+    @State private var choosingImage = false
+    @State private var logoProblem: String?
+    #if os(iOS)
+    @State private var photo: PhotosPickerItem?
+    #endif
 
     init(item: VaultItem, isNew: Bool) {
         _item = State(initialValue: item)
@@ -36,6 +45,47 @@ struct EditItemView: View {
                     }
                     Toggle("Favorite", isOn: $item.favorite)
                 }
+
+                Section {
+                    HStack(spacing: 14) {
+                        ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: 48)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.iconCustom == true ? "Your own image" : item.icon != nil ? "From the website" : "Automatic")
+                                .font(.system(size: 14, weight: .medium))
+                            Text(item.icon == nil ? "The logo appears by itself when the entry has a website." : "Shown in lists and in the entry.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    #if os(iOS)
+                    PhotosPicker(selection: $photo, matching: .images) { Label("Choose your own image…", systemImage: "photo") }
+                    #else
+                    Button { choosingImage = true } label: { Label("Choose your own image…", systemImage: "photo") }
+                    #endif
+                    if item.iconCustom == true {
+                        Button { item.icon = nil; item.iconCustom = nil; item.iconCheckedAt = nil } label: {
+                            Label("Use the website's logo instead", systemImage: "globe")
+                        }
+                    }
+                    if item.icon != nil {
+                        Button(role: .destructive) { item.icon = nil; item.iconCustom = false; item.iconCheckedAt = Date() } label: {
+                            Label("Remove logo", systemImage: "trash")
+                        }
+                    }
+                    if let logoProblem { Text(logoProblem).font(.caption).foregroundStyle(VT.red) }
+                } header: {
+                    Text("Logo")
+                }
+                .fileImporter(isPresented: $choosingImage, allowedContentTypes: [.image]) { result in
+                    guard case .success(let url) = result else { return }
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    useImage(try? Data(contentsOf: url))
+                }
+                #if os(iOS)
+                .onChange(of: photo) { _, picked in
+                    Task { useImage(try? await picked?.loadTransferable(type: Data.self)) }
+                }
+                #endif
 
                 Section("Details") {
                     ForEach($item.fields) { $field in
@@ -110,6 +160,17 @@ struct EditItemView: View {
         #endif
     }
 
+    /// Shrinks a chosen picture to a small PNG and keeps it as this entry's own logo.
+    private func useImage(_ data: Data?) {
+        guard let data, let png = SiteIcon.normalize(imageData: data, maxDimension: 128, maxBytes: 40_000) else {
+            logoProblem = "That image could not be used. Try a PNG or JPEG that is at least 16 pixels wide."
+            return
+        }
+        logoProblem = nil
+        item.icon = png
+        item.iconCustom = true
+    }
+
     private func addField(_ type: FieldType, _ label: String) {
         item.fields.append(ItemField(label: label, value: "", type: type))
     }
@@ -123,6 +184,11 @@ struct EditItemView: View {
         result.backupCodes = codesText.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         result.tags = tagsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
 
+        // A different website means a different logo (unless you chose the image yourself).
+        if result.iconCustom != true, original.website != result.website {
+            result.icon = nil
+            result.iconCheckedAt = nil
+        }
         // Changing the password keeps the old one in the history.
         if let old = original.password, !old.isEmpty, let new = result.password, new != old {
             result.passwordHistory.insert(PasswordHistoryEntry(value: old), at: 0)

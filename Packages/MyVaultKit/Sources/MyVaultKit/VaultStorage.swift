@@ -16,6 +16,8 @@ public struct SyncState: Codable, Equatable, Sendable {
     public var headerRev: String?
     public var headerDirty: Bool = false
     public var lastSync: Date?
+    /// Revision of vault.db the last time we synced with it, so an unchanged file is not downloaded again.
+    public var remoteRev: String?
 
     public init() {}
 }

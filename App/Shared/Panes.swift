@@ -144,7 +144,7 @@ struct SecurityCenterView: View {
                                 #endif
                             } label: {
                                 HStack(spacing: 12) {
-                                    ServiceTile(name: item.name, kind: item.kind, size: 34)
+                                    ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: 34)
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(item.name).font(.system(size: 14, weight: .semibold)).foregroundStyle(VT.ink)
                                         Text(item.subtitle).font(.system(size: 12)).foregroundStyle(VT.ink3)
@@ -213,6 +213,9 @@ struct SettingsView: View {
     @State private var exportDoc: BackupDocument?
     @State private var changingPassword = false
     @State private var confirmDisconnect = false
+    @State private var choosingFolder = false
+    @State private var confirmReplace = false
+    @State private var confirmUseCloud = false
 
     var body: some View {
         @Bindable var model = model
@@ -252,31 +255,81 @@ struct SettingsView: View {
             }
 
             Section {
-                if model.dropboxLinked {
+                Picker("Sync with", selection: Binding(get: { model.provider }, set: { model.selectProvider($0) })) {
+                    ForEach(CloudProvider.allCases) { Text($0.title).tag($0) }
+                }
+                .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
+                    if case .success(let url) = result { Task { await model.linkFolder(url) } }
+                }
+                if model.syncLinked {
                     LabeledContent {
                         StatusPill(text: "Connected")
                     } label: {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Dropbox")
-                            if let email = model.dropboxEmail { Text(email).font(.caption).foregroundStyle(.secondary) }
+                            Text(model.provider.title)
+                            if model.provider == .dropbox, let email = model.dropboxEmail { Text(email).font(.caption).foregroundStyle(.secondary) }
+                            if model.provider == .folder, let name = model.folderName { Text("Folder: \(name)").font(.caption).foregroundStyle(.secondary) }
                         }
                     }
-                    LabeledContent("Last sync") {
-                        Text(syncText)
+                    Toggle(isOn: Binding(get: { model.syncPaused }, set: { model.syncPaused = $0 })) {
+                        Label("Pause sync", systemImage: "pause.circle")
                     }
-                    Button { Task { await model.syncNow() } } label: { Label("Sync now", systemImage: "arrow.triangle.2.circlepath") }
+                    .tint(VT.amber)
+                    LabeledContent("Last sync") {
+                        Text(model.syncPaused ? "Paused" : syncText)
+                    }
+                    Button { Task { await model.syncNow() } } label: { Label(model.syncPaused ? "Resume sync" : "Sync now", systemImage: "arrow.triangle.2.circlepath") }
                         .disabled(model.syncStatus == .syncing)
-                    Button(role: .destructive) { confirmDisconnect = true } label: { Label("Disconnect Dropbox…", systemImage: "link.badge.plus") }
+                    if model.provider == .folder {
+                        Button { choosingFolder = true } label: { Label("Change folder…", systemImage: "folder") }
+                    }
+                    Button { confirmUseCloud = true } label: { Label("Use the vault from the cloud…", systemImage: "icloud.and.arrow.down") }
+                        .disabled(model.busy)
+                    Button(role: .destructive) { confirmReplace = true } label: { Label("Replace cloud copy with this vault…", systemImage: "icloud.and.arrow.up") }
+                        .disabled(model.busy)
+                    Button(role: .destructive) { confirmDisconnect = true } label: { Label("Disconnect \(model.provider.title)…", systemImage: "link.badge.plus") }
                 } else {
                     Button {
-                        Task { await model.connectDropbox { url, scheme in try await webAuth.authenticate(using: url, callbackURLScheme: scheme) } }
-                    } label: { Label("Connect Dropbox", systemImage: "link") }
-                    if !model.dropboxConfigured { DropboxSetupCard() }
+                        if model.provider == .folder { choosingFolder = true } else {
+                            Task { await model.connectCloud { url, scheme in try await webAuth.authenticate(using: url, callbackURLScheme: scheme) } }
+                        }
+                    } label: {
+                        Label(model.provider == .folder ? "Choose folder…" : "Connect \(model.provider.title)", systemImage: model.provider == .folder ? "folder" : "link")
+                    }
+                    if model.cloudConfigured, model.provider != .folder {
+                        Button { Task { await model.forgetAppKey() } } label: {
+                            Label(model.provider == .dropbox ? "Use a different app key…" : "Use a different client ID…", systemImage: "key")
+                        }
+                    }
+                    if !model.cloudConfigured || model.provider == .folder { CloudSetupCard() }
                 }
             } header: {
                 Text("Sync")
             } footer: {
-                Text("Only encrypted data is stored in your Dropbox, inside the app folder you created. Dropbox can never read it.")
+                Text("Only encrypted data is stored in your \(model.provider.title), in a folder only SafeVault can use. \(model.provider.title) can never read it. Switching cloud uploads your vault to the new one and keeps everything.")
+            }
+
+            Section {
+                Toggle(isOn: $model.autoLogos) {
+                    Label("Show each site's logo", systemImage: "photo.on.rectangle")
+                }
+                .tint(VT.green)
+                Button {
+                    Task {
+                        let r = await model.fetchMissingIcons()
+                        model.showToast(r.tried == 0 ? "Every entry already has its logo" : "Found \(r.found) of \(r.tried) logos")
+                    }
+                } label: {
+                    HStack {
+                        Label("Find missing logos now", systemImage: "arrow.down.circle")
+                        if model.logosBusy { Spacer(); ProgressView().controlSize(.small) }
+                    }
+                }
+                .disabled(model.logosBusy || !model.autoLogos)
+            } header: {
+                Text("Logos")
+            } footer: {
+                Text("The logo is fetched from the entry's own website, never from a third-party service, and kept inside your encrypted vault. You can choose your own image when editing an entry.")
             }
 
             Section("Data") {
@@ -307,8 +360,18 @@ struct SettingsView: View {
             exportDoc = nil
         }
         .sheet(isPresented: $changingPassword) { ChangePasswordSheet() }
-        .confirmationDialog("Disconnect Dropbox?", isPresented: $confirmDisconnect, titleVisibility: .visible) {
-            Button("Disconnect", role: .destructive) { Task { await model.disconnectDropbox() } }
+        .confirmationDialog("Use the vault from \(model.provider.title)?", isPresented: $confirmUseCloud, titleVisibility: .visible) {
+            Button("Replace this device's vault", role: .destructive) { Task { await model.useCloudVault() } }
+        } message: {
+            Text("The vault on this device is replaced by the one stored in \(model.provider.title), for example the one from your phone. You will unlock it with that vault's master password. Anything that exists only on this device is lost.")
+        }
+        .confirmationDialog("Replace the copy in \(model.provider.title)?", isPresented: $confirmReplace, titleVisibility: .visible) {
+            Button("Replace with this vault", role: .destructive) { Task { await model.replaceCloudCopy() } }
+        } message: {
+            Text("This deletes the SafeVault files that are in \(model.provider.title) now (an older vault, for example) and uploads the vault on this device. Anything only stored in that old copy is lost.")
+        }
+        .confirmationDialog("Disconnect \(model.provider.title)?", isPresented: $confirmDisconnect, titleVisibility: .visible) {
+            Button("Disconnect", role: .destructive) { Task { await model.disconnectCloud() } }
         } message: {
             Text("Your data stays on this device and in Dropbox. It just stops syncing.")
         }
@@ -318,6 +381,7 @@ struct SettingsView: View {
         switch model.syncStatus {
         case .syncing: return "Syncing…"
         case .offline: return "Offline"
+        case .quotaExceeded: return "\(model.provider.title) is full. Free some space; your data is safe on this device."
         case .failed(let m): return m
         default: return model.lastSync.map { $0.formatted(.relative(presentation: .named)) } ?? "Never"
         }
@@ -407,7 +471,8 @@ struct DropboxSetupCard: View {
                     Label("Open Dropbox App Console", systemImage: "arrow.up.forward.square")
                         .font(.system(size: 13, weight: .medium))
                 }
-                TextField("App key", text: $key)
+                TextField(text: $key, prompt: Text("App key")) { Text("App key") }
+                    .labelsHidden()
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                     #if os(iOS)
@@ -439,6 +504,94 @@ struct DropboxSetupCard: View {
             Text("\(n)").font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
                 .frame(width: 18, height: 18).background(VT.blue, in: Circle())
             Text(text).font(.system(size: 12.5)).foregroundStyle(VT.ink2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - iCloud Drive folder setup
+
+struct FolderSetupCard: View {
+    var body: some View {
+        VaultCard(padding: 16) {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("iCloud Drive, no accounts needed", systemImage: "icloud")
+                    .font(.system(size: 14, weight: .semibold))
+                VStack(alignment: .leading, spacing: 6) {
+                    step(1, "In **Files** (iPhone) or **Finder** (Mac) open **iCloud Drive** and create a folder, for example **SafeVault**.")
+                    step(2, "Press **Choose folder…** and pick it. SafeVault keeps its encrypted files there.")
+                    step(3, "On your other device do the same and pick **that same folder**. Both need iCloud Drive turned on.")
+                }
+                Text("It also works with a folder from Dropbox, Google Drive or OneDrive if their app shows it in Files.")
+                    .font(.system(size: 12)).foregroundStyle(VT.ink3)
+            }
+        }
+    }
+
+    private func step(_ n: Int, _ text: LocalizedStringKey) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("\(n)").font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                .frame(width: 18, height: 18).background(VT.blue, in: Circle())
+            Text(text).font(.system(size: 12.5)).foregroundStyle(VT.ink2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - Google Drive client ID setup
+
+/// Guides through creating a Google OAuth client once, and takes its client ID. After that "Connect Google Drive"
+/// opens the browser for the normal Google login. Only the hidden app-data folder of your Drive is requested.
+struct GoogleSetupCard: View {
+    @Environment(AppModel.self) private var model
+    @State private var clientID = ""
+
+    private var bundleID: String { Bundle.main.bundleIdentifier ?? "com.federicomencuccini.myvault" }
+
+    var body: some View {
+        VaultCard(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("One-time Google Drive setup", systemImage: "link.badge.plus")
+                    .font(.system(size: 14, weight: .semibold))
+                VStack(alignment: .leading, spacing: 6) {
+                    step(1, "In Google Cloud Console create a **project** (any name) and enable the **Google Drive API** in *APIs & Services → Library*.")
+                    step(2, "*OAuth consent screen* (Google Auth Platform): **External**, app name SafeVault. Add the scope `drive.appdata`, then **Publish app** (otherwise Google logs you out every 7 days). It is not sensitive, so no review is needed.")
+                    step(3, "*Credentials → Create credentials → OAuth client ID*, type **iOS**, bundle ID `\(bundleID)`. Copy the **Client ID** and paste it below. No redirect address is needed.")
+                }
+                Link(destination: URL(string: "https://console.cloud.google.com/projectcreate")!) {
+                    Label("Open Google Cloud Console", systemImage: "arrow.up.forward.square")
+                        .font(.system(size: 13, weight: .medium))
+                }
+                TextField(text: $clientID, prompt: Text("123456-abc.apps.googleusercontent.com")) { Text("Client ID") }
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                Button("Save client ID") { model.saveGoogleClientID(clientID) }
+                    .buttonStyle(SoftButtonStyle(prominent: true))
+                    .disabled(clientID.trimmingCharacters(in: .whitespaces).count < 20)
+            }
+        }
+    }
+
+    private func step(_ n: Int, _ text: LocalizedStringKey) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("\(n)").font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                .frame(width: 18, height: 18).background(VT.blue, in: Circle())
+            Text(text).font(.system(size: 12.5)).foregroundStyle(VT.ink2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// The setup box for whichever cloud is selected.
+struct CloudSetupCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        switch model.provider {
+        case .folder: FolderSetupCard()
+        case .dropbox: DropboxSetupCard()
+        case .googleDrive: GoogleSetupCard()
         }
     }
 }

@@ -114,6 +114,7 @@ struct ToastView: View {
 struct LockView: View {
     @Environment(AppModel.self) private var model
     @State private var password = ""
+    @State private var confirmErase = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -168,6 +169,11 @@ struct LockView: View {
                     if let error = model.unlockError {
                         Text(error).font(.system(size: 12.5)).foregroundStyle(VT.red).multilineTextAlignment(.center)
                     }
+                    Button("Forgot your password?") { confirmErase = true }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(VT.ink3)
+                        .padding(.top, 4)
                 }
                 .frame(maxWidth: 320)
                 .padding(.top, model.biometricUnlockOffered ? 26 : 34)
@@ -179,6 +185,11 @@ struct LockView: View {
                     .padding(.bottom, 24)
             }
             .padding(.horizontal, 24)
+        }
+        .confirmationDialog("Erase this vault and start over?", isPresented: $confirmErase, titleVisibility: .visible) {
+            Button("Erase vault on this device", role: .destructive) { model.eraseVault() }
+        } message: {
+            Text("A forgotten master password cannot be recovered by anyone. This deletes the vault on this device so you can create a new one. Copies in your cloud are not touched, and passwords you still have in Safe can be imported again.")
         }
         .task {
             guard !model.demoMode, model.biometricUnlockOffered else { focused = true; return }
@@ -217,6 +228,7 @@ struct OnboardingView: View {
     @State private var understood = false
     @State private var useBiometrics = true
     @State private var restoring = false
+    @State private var choosingFolder = false
 
     var body: some View {
         ZStack {
@@ -244,12 +256,12 @@ struct OnboardingView: View {
         VStack(spacing: 14) {
             AppMark(size: 92)
             Text("SafeVault").font(.system(size: 32, weight: .bold)).tracking(-0.8).padding(.top, 6)
-            Text("Your passwords, encrypted on your own devices and synced through your own Dropbox.")
+            Text("Your passwords, encrypted on your own devices and synced through your own Dropbox or Google Drive.")
                 .font(.system(size: 15)).foregroundStyle(VT.ink2).multilineTextAlignment(.center).lineSpacing(2)
             VStack(spacing: 10) {
                 Button { step = .create } label: { Text("Create a new vault").frame(maxWidth: .infinity) }
                     .buttonStyle(SoftButtonStyle(prominent: true))
-                Button { step = .join } label: { Text("I already have a vault in Dropbox").frame(maxWidth: .infinity) }
+                Button { step = .join } label: { Text("I already have a vault in the cloud").frame(maxWidth: .infinity) }
                     .buttonStyle(SoftButtonStyle())
                 Button { restoring = true } label: { Text("Restore from a backup file").frame(maxWidth: .infinity) }
                     .buttonStyle(SoftButtonStyle())
@@ -340,25 +352,40 @@ struct OnboardingView: View {
     private var join: some View {
         VStack(alignment: .leading, spacing: 14) {
             Button { step = .welcome } label: { Label("Back", systemImage: "chevron.left") }.buttonStyle(.plain).foregroundStyle(VT.blue)
-            Text("Connect your Dropbox").font(.system(size: 26, weight: .bold)).tracking(-0.5)
-            Text("Sign in to the Dropbox where your other device keeps SafeVault. You will then unlock it with your master password.")
+            Text("Connect your cloud").font(.system(size: 26, weight: .bold)).tracking(-0.5)
+            Picker("Cloud", selection: Binding(get: { model.provider }, set: { model.selectProvider($0) })) {
+                ForEach(CloudProvider.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
+                guard case .success(let url) = result else { return }
+                Task {
+                    await model.linkFolder(url)
+                    if model.syncLinked { _ = await model.fetchVaultFromCloud() }
+                }
+            }
+            Text("Sign in to the \(model.provider.title) where your other device keeps SafeVault. You will then unlock it with your master password.")
                 .font(.system(size: 14)).foregroundStyle(VT.ink2)
             Button {
+                if model.provider == .folder { choosingFolder = true; return }
                 Task {
-                    if !model.dropboxLinked {
-                        await model.connectDropbox { url, scheme in try await webAuth.authenticate(using: url, callbackURLScheme: scheme) }
+                    if !model.syncLinked {
+                        await model.connectCloud { url, scheme in try await webAuth.authenticate(using: url, callbackURLScheme: scheme) }
                     }
-                    if model.dropboxLinked { _ = await model.fetchVaultFromDropbox() }
+                    if model.syncLinked { _ = await model.fetchVaultFromCloud() }
                 }
             } label: {
                 Group {
-                    if model.busy { ProgressView().controlSize(.small).tint(.white) } else { Label("Connect Dropbox", systemImage: "link") }
+                    if model.busy { ProgressView().controlSize(.small).tint(.white) } else {
+                        Label(model.provider == .folder ? "Choose folder…" : "Connect \(model.provider.title)", systemImage: model.provider == .folder ? "folder" : "link")
+                    }
                 }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(SoftButtonStyle(prominent: true))
             .disabled(model.busy)
-            if !model.dropboxConfigured { DropboxSetupCard() }
+            if !model.cloudConfigured || model.provider == .folder { CloudSetupCard() }
         }
     }
 }

@@ -17,15 +17,18 @@ public enum RemoteError: Error, Equatable, LocalizedError {
     case unauthorized
     case offline
     case rateLimited(retryAfter: Int)
+    /// The cloud account has no space left (or is over its quota), so nothing new can be saved there.
+    case quotaExceeded
     case server(String)
 
     public var errorDescription: String? {
         switch self {
-        case .conflict: "The file changed on Dropbox while syncing."
-        case .notFound: "File not found on Dropbox."
-        case .unauthorized: "Dropbox needs you to sign in again."
-        case .offline: "No connection to Dropbox."
-        case .rateLimited(let s): "Dropbox asked to wait \(s) seconds."
+        case .conflict: "The file changed in the cloud while syncing."
+        case .notFound: "File not found in the cloud."
+        case .unauthorized: "You need to sign in to the cloud again."
+        case .offline: "No connection to the cloud."
+        case .rateLimited(let s): "The cloud asked to wait \(s) seconds."
+        case .quotaExceeded: "Your cloud storage is full. SafeVault keeps working on this device; free some space to sync again."
         case .server(let m): m
         }
     }
@@ -38,6 +41,18 @@ public protocol RemoteStore: Sendable {
     /// With `expectedRev == nil` the file must not exist yet. Otherwise its revision must match.
     /// Both cases throw `RemoteError.conflict` when that is not true.
     func upload(_ name: String, data: Data, expectedRev: String?) async throws -> String
+    /// Copies the cloud made when two devices wrote the same file at once. Most clouds never do.
+    func conflictCopies() async throws -> [ConflictCopy]
+    /// Called once a copy has been merged, so it is not processed again.
+    func resolveConflictCopy(_ fileName: String) async throws
+    /// Removes a file. Used to clear out the old one-file-per-item layout; a store may ignore it.
+    func deleteFile(_ name: String) async throws
+}
+
+public extension RemoteStore {
+    func conflictCopies() async throws -> [ConflictCopy] { [] }
+    func resolveConflictCopy(_ fileName: String) async throws {}
+    func deleteFile(_ name: String) async throws {}
 }
 
 public struct SyncReport: Equatable, Sendable {
@@ -48,148 +63,154 @@ public struct SyncReport: Equatable, Sendable {
     public init() {}
 }
 
+/// Two-way sync through ONE file, `vault.db`.
+///
+/// Each sync: if the cloud file changed (or we have changes), download it, merge it item by item with the rule
+/// "the most recent edit wins and the other version is kept in that item's history", and upload the result if it
+/// differs. A file that cannot be read is never overwritten.
 public actor SyncEngine {
     private let session: VaultSession
     private let remote: RemoteStore
+
+    private static let legacyHeader = VaultStorage.headerName
 
     public init(session: VaultSession, remote: RemoteStore) {
         self.session = session
         self.remote = remote
     }
 
-    /// Two-way sync. Never deletes a remote file and never discards an edit without keeping a copy in the item's history.
     public func sync(now: Date = Date()) async throws -> SyncReport {
         var report = SyncReport()
+        let name = VaultFile.name
         var files = Dictionary(uniqueKeysWithValues: try await remote.listFiles().map { ($0.name, $0.rev) })
 
-        try await syncHeader(&files)
-
-        // Pull
-        for (name, rev) in files {
-            guard let id = VaultStorage.itemID(fromName: name) else { continue }
-            let key = id.uuidString.lowercased()
-            let known = await session.currentState().records[key]
-            if known?.rev == rev { continue }
+        // Copies the cloud made for simultaneous writes of vault.db (iCloud calls them "vault 2.db").
+        for copy in try await remote.conflictCopies() where copy.baseName == name {
             do {
-                try await pull(id: id, name: name, report: &report)
-            } catch let error as RemoteError where error == .offline || error == .unauthorized {
+                let outcome = try await session.mergeSyncFile(copy.data)
+                report.conflicts += max(1, outcome.conflicts)
+                try await remote.resolveConflictCopy(copy.fileName)
+            } catch let error as RemoteError where Self.isFatal(error) {
                 throw error
             } catch {
-                report.failed.append(name)
+                report.failed.append(copy.fileName)
             }
         }
 
-        // Anything we think is on the remote but is gone: upload it again rather than lose it.
-        let state = await session.currentState()
-        for (key, rec) in state.records where rec.rev != nil && !rec.dirty {
-            guard let id = UUID(uuidString: key), files[VaultStorage.itemName(id)] == nil else { continue }
-            try await session.updateState { $0.records[key] = RecordState(rev: nil, dirty: true) }
-        }
+        var legacy = [String]()
+        for attempt in 0..<4 {
+            let rev = files[name]
+            let state = await session.currentState()
+            let localChanges = !state.records.isEmpty || state.headerDirty
 
-        // Push
-        let dirty = await session.currentState().records.filter { $0.value.dirty }
-        for (key, rec) in dirty {
-            guard let id = UUID(uuidString: key) else { continue }
-            do {
-                try await push(id: id, expectedRev: rec.rev, report: &report)
-            } catch let error as RemoteError where error == .offline || error == .unauthorized {
-                throw error
-            } catch {
-                report.failed.append(VaultStorage.itemName(id))
+            // Nothing changed on either side: nothing to do, and nothing to download.
+            if let rev, rev == state.remoteRev, !localChanges { break }
+
+            var toUpload = 0
+            if let rev {
+                let (data, newRev) = try await remote.download(name)
+                let outcome = try await session.mergeSyncFile(data)
+                report.pulled += outcome.pulled
+                report.conflicts += outcome.conflicts
+                toUpload = outcome.toUpload
+                if !outcome.needsUpload {
+                    try await session.updateState { $0.remoteRev = newRev; $0.records = [:]; $0.headerDirty = false }
+                    break
+                }
+            } else {
+                // No vault.db yet. If an older version of the app left one file per item, bring those in first.
+                if files[Self.legacyHeader] != nil { legacy = try await absorbLegacy(files: files, report: &report) }
+                toUpload = await session.allRawItems().count + 1
             }
+
+            let bytes = try await session.exportSyncFile()
+            do {
+                let newRev = try await remote.upload(name, data: bytes, expectedRev: rev)
+                try await session.updateState { $0.remoteRev = newRev; $0.records = [:]; $0.headerDirty = false }
+                report.pushed = toUpload
+                break
+            } catch RemoteError.conflict {
+                // Someone wrote in between: look again, merge with what is there now, and retry.
+                files = Dictionary(uniqueKeysWithValues: try await remote.listFiles().map { ($0.name, $0.rev) })
+            } catch RemoteError.notFound {
+                files[name] = nil
+            }
+            if attempt == 3 { throw RemoteError.conflict }
         }
 
+        if !legacy.isEmpty { await removeLegacy(legacy) }
         try await session.updateState { $0.lastSync = now }
         return report
     }
 
-    // MARK: Header
-
-    private func syncHeader(_ files: inout [String: String]) async throws {
-        let name = VaultStorage.headerName
-        let state = await session.currentState()
-        if let rev = files[name] {
-            if rev != state.headerRev {
-                let (data, newRev) = try await remote.download(name)
-                _ = try await session.adoptRemoteHeader(data)
-                try await session.updateState { $0.headerRev = newRev }
-                files[name] = newRev
-            }
-            if await session.currentState().headerDirty {
-                let data = try await session.headerData()
-                let newRev = try await remote.upload(name, data: data, expectedRev: files[name])
-                try await session.updateState { $0.headerRev = newRev; $0.headerDirty = false }
-                files[name] = newRev
-            }
-        } else {
-            let data = try await session.headerData()
-            let newRev = try await remote.upload(name, data: data, expectedRev: nil)
-            try await session.updateState { $0.headerRev = newRev; $0.headerDirty = false }
-            files[name] = newRev
-        }
+    private static func isFatal(_ error: RemoteError) -> Bool {
+        error == .offline || error == .unauthorized || error == .quotaExceeded
     }
 
-    // MARK: Items
+    // MARK: Old layout (header.json + one .vitem per item)
 
-    private func pull(id: UUID, name: String, report: inout SyncReport) async throws {
-        let (blob, rev) = try await remote.download(name)
-        let remoteItem = try await session.decryptRemote(blob, id: id)
-        let key = id.uuidString.lowercased()
-        let record = await session.currentState().records[key]
-        let local = await session.rawItem(id)
-
-        guard let local, record?.dirty == true else {
-            // Nothing local to protect: take the remote copy.
-            try await session.storeSynced(remoteItem, rev: rev, dirty: false)
-            report.pulled += 1
-            return
-        }
-
-        if Self.sameContent(local, remoteItem) {
-            try await session.storeSynced(local, rev: rev, dirty: local != remoteItem)
-            return
-        }
-        let (winner, localWon) = Self.merge(local: local, remote: remoteItem)
-        try await session.storeSynced(winner, rev: rev, dirty: localWon || winner != remoteItem)
-        report.conflicts += 1
-        report.pulled += localWon ? 0 : 1
-    }
-
-    private func push(id: UUID, expectedRev: String?, report: inout SyncReport) async throws {
-        let key = id.uuidString.lowercased()
-        let name = VaultStorage.itemName(id)
-        var rev = expectedRev
-        for attempt in 0..<3 {
-            let blob = try await session.encryptedBlob(for: id)
+    private func absorbLegacy(files: [String: String], report: inout SyncReport) async throws -> [String] {
+        var names = [String]()
+        let headerData = try await remote.download(Self.legacyHeader).data
+        _ = try await session.adoptRemoteHeader(headerData)  // also refuses a different vault
+        names.append(Self.legacyHeader)
+        for (file, _) in files {
+            guard let id = VaultStorage.itemID(fromName: file) else { continue }
             do {
-                let newRev = try await remote.upload(name, data: blob, expectedRev: rev)
-                try await session.updateState { $0.records[key] = RecordState(rev: newRev, dirty: false) }
-                report.pushed += 1
-                return
-            } catch RemoteError.conflict {
-                // Someone else wrote in between: merge with what is there now and try again.
-                let files = try await remote.listFiles()
-                if let current = files.first(where: { $0.name == name }) {
-                    try await pull(id: id, name: name, report: &report)
-                    rev = await session.currentState().records[key]?.rev ?? current.rev
-                } else {
-                    rev = nil
-                }
-            } catch RemoteError.notFound {
-                rev = nil
+                let blob = try await remote.download(file).data
+                try await session.absorbCopy(try await session.decryptRemote(blob, id: id))
+                names.append(file)
+                report.pulled += 1
+            } catch let error as RemoteError where Self.isFatal(error) {
+                throw error
+            } catch {
+                report.failed.append(file)  // left in place, never deleted
             }
-            if attempt == 2 { throw RemoteError.conflict }
         }
+        return names
     }
+
+    /// Deletes the old files, but only once vault.db is confirmed to hold everything.
+    private func removeLegacy(_ names: [String]) async {
+        guard report(names), let check = try? await remote.download(VaultFile.name),
+              await session.syncFileHoldsEverything(check.data) else { return }
+        for name in names { try? await remote.deleteFile(name) }
+    }
+
+    private func report(_ names: [String]) -> Bool { !names.isEmpty }
 
     // MARK: Merge
 
+    /// Same data, ignoring bookkeeping (history, last use, edit time).
     static func sameContent(_ a: VaultItem, _ b: VaultItem) -> Bool {
         var x = a, y = b
         x.history = []; y.history = []
         x.lastUsedAt = nil; y.lastUsedAt = nil
+        x.icon = nil; y.icon = nil
+        x.iconCustom = nil; y.iconCustom = nil
+        x.iconCheckedAt = nil; y.iconCheckedAt = nil
         x.modifiedAt = y.modifiedAt
-        return x == y
+        return x.canonicalBytes == y.canonicalBytes
+    }
+
+    /// Two copies with the same data: keep the latest use and the union of the histories, so both devices
+    /// end up with an identical item.
+    static func mergeSameContent(_ a: VaultItem, _ b: VaultItem) -> VaultItem {
+        var m = a.modifiedAt >= b.modifiedAt ? a : b
+        m.lastUsedAt = [a.lastUsedAt, b.lastUsedAt].compactMap { $0 }.max()
+        m.history = VaultItem.mergedHistory(a.history, b.history)
+        applyBestIcon(&m, a, b)
+        return m
+    }
+
+    /// Both devices must pick the same icon: one you chose beats a downloaded one; otherwise the bigger file wins.
+    static func applyBestIcon(_ m: inout VaultItem, _ a: VaultItem, _ b: VaultItem) {
+        func rank(_ x: VaultItem) -> (Int, Int) { (x.iconCustom == true ? 1 : 0, x.icon?.count ?? 0) }
+        var winner = rank(a) != rank(b) ? (rank(a) > rank(b) ? a : b) : a
+        if rank(a) == rank(b), let da = a.icon, let db = b.icon, da != db { winner = da.lexicographicallyPrecedes(db) ? b : a }
+        m.icon = winner.icon
+        m.iconCustom = winner.iconCustom
+        m.iconCheckedAt = [a.iconCheckedAt, b.iconCheckedAt].compactMap { $0 }.max()
     }
 
     /// The most recent edit wins; the other version is kept in the winner's history.
@@ -197,12 +218,16 @@ public actor SyncEngine {
         if remote.modifiedAt > local.modifiedAt {
             var w = remote
             if !local.deleted { w.appendHistory(local.snapshot(reason: "Replaced by a newer edit from another device", at: local.modifiedAt)) }
+            w.history = VaultItem.mergedHistory(w.history, local.history)
             w.lastUsedAt = [local.lastUsedAt, remote.lastUsedAt].compactMap { $0 }.max()
+            applyBestIcon(&w, local, remote)
             return (w, false)
         }
         var w = local
         if !remote.deleted { w.appendHistory(remote.snapshot(reason: "Replaced by a newer edit on this device", at: remote.modifiedAt)) }
+        w.history = VaultItem.mergedHistory(w.history, remote.history)
         w.lastUsedAt = [local.lastUsedAt, remote.lastUsedAt].compactMap { $0 }.max()
+        applyBestIcon(&w, local, remote)
         return (w, true)
     }
 }
@@ -250,4 +275,9 @@ public actor InMemoryRemote: RemoteStore {
     }
 
     public func removeFile(_ name: String) { files[name] = nil }
+
+    public func deleteFile(_ name: String) async throws {
+        if offline { throw RemoteError.offline }
+        files[name] = nil
+    }
 }

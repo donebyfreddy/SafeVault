@@ -128,7 +128,10 @@ public actor VaultSession {
     /// Adds many items at once (importing). Returns how many were stored.
     @discardableResult
     public func importItems(_ new: [VaultItem]) throws -> Int {
-        for item in new { try persist(item, markDirty: true) }
+        // One bookkeeping write for the whole batch instead of one per item.
+        for item in new { try persist(item, markDirty: false) }
+        for item in new { state.records[item.id.uuidString.lowercased()] = RecordState(rev: nil, dirty: true) }
+        try storage.saveState(state)
         return new.count
     }
 
@@ -188,9 +191,103 @@ public actor VaultSession {
         try storage.saveState(fresh)
     }
 
+    // MARK: vault.db
+
+    public struct MergeOutcome: Sendable, Equatable {
+        /// Items that came from the cloud and changed what we have.
+        public var pulled = 0
+        /// Items whose two versions differed and were merged.
+        public var conflicts = 0
+        /// Items (or the header) that the cloud copy does not have yet.
+        public var toUpload = 0
+        public var needsUpload: Bool { toUpload > 0 }
+    }
+
+    /// Everything, sealed in one blob, ready to be uploaded as `vault.db`.
+    public func exportSyncFile() throws -> Data {
+        guard let key = vaultKey else { throw VaultError.corrupted }
+        let list = items.values.sorted { $0.id.uuidString < $1.id.uuidString }
+        let sealed = try VaultCrypto.seal(try VaultStorage.encoder.encode(VaultFile.Payload(items: list)), key: key, context: VaultFile.context)
+        let container = VaultFile.Container(format: VaultFile.formatName, version: VaultFile.currentVersion, header: header, payload: sealed)
+        return try VaultStorage.encoder.encode(container)
+    }
+
+    /// Merges a downloaded `vault.db` into what we have. Throws, changing nothing, if the file cannot be read
+    /// with our key or belongs to another vault: the caller must then NOT upload over it.
+    public func mergeSyncFile(_ data: Data) throws -> MergeOutcome {
+        guard let key = vaultKey else { throw VaultError.corrupted }
+        let container = try VaultFile.decode(data)
+        guard container.header.vaultID == header.vaultID else { throw VaultError.differentVault }
+        let plain = try VaultCrypto.open(container.payload, key: key, context: VaultFile.context)
+        let remoteItems: [VaultItem]
+        do { remoteItems = try VaultStorage.decoder.decode(VaultFile.Payload.self, from: plain).items } catch { throw VaultError.corrupted }
+
+        var outcome = MergeOutcome()
+        let remote = container.header
+        // Dates that went through a file can differ in the last bit, so "newer" means newer by over a millisecond.
+        let dt = remote.updatedAt.timeIntervalSince(header.updatedAt)
+        if remote.revision > header.revision || (remote.revision == header.revision && dt > 0.001) {
+            header = remote  // a newer master password from another device
+            try storage.saveHeader(header)
+        } else if remote.revision < header.revision || (remote.revision == header.revision && dt < -0.001) {
+            outcome.toUpload += 1
+        }
+
+        var remoteByID = [UUID: VaultItem]()
+        for r in remoteItems { remoteByID[r.id] = r }
+        for r in remoteItems {
+            guard let local = items[r.id] else {
+                try persist(r, markDirty: false)
+                outcome.pulled += 1
+                continue
+            }
+            if local.canonicalBytes == r.canonicalBytes { continue }
+            let merged: VaultItem
+            if SyncEngine.sameContent(local, r) {
+                merged = SyncEngine.mergeSameContent(local, r)
+            } else {
+                merged = SyncEngine.merge(local: local, remote: r).winner
+                outcome.conflicts += 1
+            }
+            if merged.canonicalBytes != local.canonicalBytes {
+                try persist(merged, markDirty: false)
+                if merged.modifiedAt >= local.modifiedAt, merged.fields != local.fields || merged.name != local.name { outcome.pulled += 1 }
+            }
+        }
+        for (id, local) in items where remoteByID[id]?.canonicalBytes != local.canonicalBytes { outcome.toUpload += 1 }
+        return outcome
+    }
+
+    /// Whether a downloaded vault.db can be read and holds every item we have. Used before deleting old files.
+    public func syncFileHoldsEverything(_ data: Data) -> Bool {
+        guard let key = vaultKey, let container = try? VaultFile.decode(data),
+              let plain = try? VaultCrypto.open(container.payload, key: key, context: VaultFile.context),
+              let payload = try? VaultStorage.decoder.decode(VaultFile.Payload.self, from: plain) else { return false }
+        let ids = Set(payload.items.map(\.id))
+        return items.keys.allSatisfy { ids.contains($0) }
+    }
+
     // MARK: Sync hooks (used by SyncEngine)
 
     func currentState() -> SyncState { state }
+
+    /// Merges a version found in a conflict copy into the item we have. The result is marked to upload.
+    func absorbCopy(_ remote: VaultItem) throws {
+        guard let local = items[remote.id] else { try persist(remote, markDirty: true); return }
+        if SyncEngine.sameContent(local, remote) { return }
+        try persist(SyncEngine.merge(local: local, remote: remote).winner, markDirty: true)
+    }
+
+    /// Forget what is known about the cloud copy: every item and the header are uploaded again, and anything
+    /// already there is merged by the normal conflict rules. Used when switching to another cloud.
+    public func resetSyncState() throws {
+        var fresh = SyncState()
+        fresh.headerDirty = true
+        fresh.lastSync = nil
+        for id in items.keys { fresh.records[id.uuidString.lowercased()] = RecordState(rev: nil, dirty: true) }
+        state = fresh
+        try storage.saveState(fresh)
+    }
 
     func updateState(_ change: (inout SyncState) -> Void) throws {
         change(&state)

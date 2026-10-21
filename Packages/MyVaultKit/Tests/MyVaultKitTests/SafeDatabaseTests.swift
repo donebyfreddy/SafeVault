@@ -136,8 +136,10 @@ final class SafeDatabaseTests: XCTestCase {
         XCTAssertThrowsError(try SafeInCloudDatabase.decrypt(file.prefix(20), password: "pw"))
         XCTAssertThrowsError(try SafeInCloudDatabase.decrypt(Data(), password: "pw"))
         XCTAssertThrowsError(try SafeInCloudDatabase.decrypt(VaultCrypto.randomBytes(500), password: "pw"))
-        // Damage in the middle of the data destroys the compressed content: must be rejected.
-        var damaged = file
+        // Damage in the middle of the compressed content must be rejected (a big file, so the middle is real data).
+        let cards = (0..<300).map { "<card title=\"Site \($0)\"><field name=\"Login\" type=\"login\">user\($0)</field><field name=\"Password\" type=\"password\">pw\($0)-\(UUID().uuidString)</field></card>" }.joined()
+        let big = SafeFixture.make(xml: "<database>\(cards)</database>", password: "pw")
+        var damaged = big
         damaged[damaged.count / 2] ^= 0xFF
         XCTAssertThrowsError(try SafeInCloudDatabase.decrypt(damaged, password: "pw"))
     }

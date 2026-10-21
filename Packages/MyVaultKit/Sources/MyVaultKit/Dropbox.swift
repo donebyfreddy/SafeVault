@@ -191,6 +191,10 @@ public struct DropboxRemoteStore: RemoteStore {
         return rev
     }
 
+    public func deleteFile(_ name: String) async throws {
+        do { _ = try await rpc("files/delete_v2", ["path": "/\(name)"]) } catch RemoteError.notFound {}
+    }
+
     // MARK: Plumbing
 
     private func rpc(_ endpoint: String, _ params: [String: Any]) async throws -> [String: Any] {
@@ -225,6 +229,7 @@ public struct DropboxRemoteStore: RemoteStore {
 
     static func mapConflict(_ data: Data) -> RemoteError {
         let summary = ((try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error_summary"] as? String) ?? ""
+        if summary.contains("insufficient_space") { return .quotaExceeded }
         if summary.contains("conflict") { return .conflict }
         if summary.contains("not_found") { return .notFound }
         return .server(summary.isEmpty ? "Dropbox rejected the request." : summary)

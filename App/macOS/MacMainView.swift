@@ -113,20 +113,24 @@ struct SyncCard: View {
     @Environment(AppModel.self) private var model
 
     private var statusColor: Color {
-        switch model.syncStatus {
+        if model.syncPaused { return VT.ink3 }
+        return switch model.syncStatus {
         case .idle: VT.green
         case .syncing: VT.amber
         case .offline: VT.ink3
+        case .quotaExceeded: VT.amber
         case .failed: VT.red
         case .notConfigured: VT.ink3
         }
     }
 
     private var detail: String {
+        if model.syncPaused { return "Tap to resume" }
         switch model.syncStatus {
         case .notConfigured: return "Tap to connect"
         case .syncing: return "Encrypting changes"
         case .offline: return "Will sync when online"
+        case .quotaExceeded: return "Free space to sync"
         case .failed(let m): return m
         case .idle:
             guard let t = model.lastSync else { return "Not synced yet" }
@@ -136,10 +140,10 @@ struct SyncCard: View {
 
     var body: some View {
         Button {
-            if model.dropboxLinked { Task { await model.syncNow() } } else { model.nav = .settings }
+            if model.syncLinked { Task { await model.syncNow() } } else { model.nav = .settings }
         } label: {
             HStack(spacing: 10) {
-                ServiceTile(name: "Dropbox", size: 28)
+                ServiceTile(name: model.provider.title, size: 28)
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 6) {
                         Circle().fill(statusColor).frame(width: 7, height: 7)

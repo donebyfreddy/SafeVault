@@ -93,6 +93,7 @@ struct PhoneHome: View {
 
     var body: some View {
         @Bindable var model = model
+        let visible = model.visibleItems
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
@@ -129,10 +130,10 @@ struct PhoneHome: View {
                 .padding(.top, 8)
 
                 if searching {
-                    section("Results", items: model.visibleItems)
+                    section("Results", items: visible)
                 } else {
                     chips.padding(.top, 14)
-                    let groups = Grouping.groups(nav: model.nav, items: model.visibleItems, searching: false)
+                    let groups = Grouping.groups(nav: model.nav, items: visible, searching: false)
                     if groups.isEmpty {
                         VStack(spacing: 6) {
                             Text("Nothing here yet").font(.system(size: 15, weight: .semibold))
@@ -140,7 +141,10 @@ struct PhoneHome: View {
                         }
                         .frame(maxWidth: .infinity).padding(.top, 50)
                     }
-                    ForEach(groups) { g in section(g.title, items: g.items, seeAll: g.id == "fav" && model.nav == .all) }
+                    // Lazy: only the sections on screen are built, however many items there are.
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(groups) { g in section(g.title, items: g.items, seeAll: g.id == "fav" && model.nav == .all) }
+                    }
                 }
             }
             .padding(.horizontal, 16)
@@ -163,6 +167,15 @@ struct PhoneHome: View {
             (.all, "All", "lock"), (.favorites, "Favorites", "star.fill"),
             (.category(.login), "Logins", "key"), (.category(.card), "Cards", "creditcard"),
         ]
+        let counts = model.chipCounts
+        func count(_ nav: Nav) -> Int {
+            switch nav {
+            case .all: counts.all
+            case .favorites: counts.favorites
+            case .category(.login): counts.logins
+            default: counts.cards
+            }
+        }
         return HStack(spacing: 8) {
             ForEach(Array(defs.enumerated()), id: \.offset) { _, d in
                 let active = model.nav == d.0
@@ -172,7 +185,7 @@ struct PhoneHome: View {
                             .foregroundStyle(active ? .white.opacity(0.9) : (d.0 == .favorites ? VT.star : VT.ink2))
                             .padding(.bottom, 2)
                         Text(d.1).font(.system(size: 11, weight: .semibold))
-                        Text("\(model.count(for: d.0))").font(.system(size: 11)).foregroundStyle(active ? .white.opacity(0.85) : VT.ink3)
+                        Text("\(count(d.0))").font(.system(size: 11)).foregroundStyle(active ? .white.opacity(0.85) : VT.ink3)
                     }
                     .foregroundStyle(active ? .white : VT.ink)
                     .frame(maxWidth: .infinity)
@@ -196,12 +209,12 @@ struct PhoneHome: View {
                 }
             }
             VaultCard {
-                VStack(spacing: 0) {
+                LazyVStack(spacing: 0) {
                     ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
                         if i > 0 { Divider().overlay(VT.line).padding(.leading, 58) }
                         NavigationLink(value: item.id) {
                             HStack(spacing: 12) {
-                                ServiceTile(name: item.name, kind: item.kind, size: 34)
+                                ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: 34)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name).font(.system(size: 14.5, weight: .semibold)).foregroundStyle(VT.ink).lineLimit(1)
                                     Text(item.subtitle).font(.system(size: 12)).foregroundStyle(VT.ink3).lineLimit(1)

@@ -48,14 +48,21 @@ public enum SafeInCloudDatabase {
             guard let iv2 = try? innerReader.prefixed(), let key2 = try? innerReader.prefixed(),
                   iv2.count == 16, [16, 24, 32].contains(key2.count),
                   let compressed = aesCBCDecrypt(rest, key: key2, iv: iv2) else { continue }
-            // Strict: PKCS#7 padding plus the adler32 trailer must both be right.
-            if let unpadded = stripPadding(compressed), let xml = try? inflateZlib(unpadded, verifyTrailer: true), !xml.isEmpty {
-                return (xml, true)
+            // Strict: PKCS#7 padding plus the adler32 trailer must both be right. If the padding is right but the
+            // checksum is not, the data is damaged: never fall back to a more lenient reading.
+            if let unpadded = stripPadding(compressed) {
+                if let xml = try? inflateZlib(unpadded, verifyTrailer: true), !xml.isEmpty { return (xml, true) }
+                continue
             }
-            // Lenient: some writers may not pad; the deflate stream's own end marker still delimits the data.
-            if let xml = try? inflateZlib(compressed, verifyTrailer: false), !xml.isEmpty { return (xml, false) }
+            // Some writers may not use PKCS#7; the deflate end marker still delimits the data. Accept it only
+            // if it is well-formed XML, and say it could not be verified.
+            if let xml = try? inflateZlib(compressed, verifyTrailer: false), !xml.isEmpty, isWellFormedXML(xml) { return (xml, false) }
         }
         throw VaultError.wrongPassword
+    }
+
+    private static func isWellFormedXML(_ data: Data) -> Bool {
+        XMLParser(data: data).parse()
     }
 
     // MARK: Primitives

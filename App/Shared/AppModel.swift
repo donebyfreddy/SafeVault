@@ -30,10 +30,23 @@ struct ImportPreview {
     var deletable = true
 }
 
+enum CloudProvider: String, CaseIterable, Identifiable {
+    case folder, dropbox, googleDrive
+    var id: String { rawValue }
+    /// `folder` is any folder you pick in Files; iCloud Drive is the usual choice.
+    var title: String {
+        switch self {
+        case .folder: "iCloud Drive"
+        case .dropbox: "Dropbox"
+        case .googleDrive: "Google Drive"
+        }
+    }
+}
+
 @MainActor @Observable
 final class AppModel {
     enum Phase { case launching, setup, locked, unlocked }
-    enum SyncStatus: Equatable { case notConfigured, idle, syncing, offline, failed(String) }
+    enum SyncStatus: Equatable { case notConfigured, idle, syncing, offline, quotaExceeded, failed(String) }
 
     // MARK: State
 
@@ -52,6 +65,15 @@ final class AppModel {
     var lastSync: Date?
     var dropboxLinked = false
     var dropboxEmail: String?
+    var googleLinked = false
+    var folderLinked = false
+    var folderName: String?
+    private var folderURL: URL?
+    private var folderAccess = false
+    /// Which cloud keeps the encrypted copy of the vault. You choose it in Settings or when joining a vault.
+    var provider: CloudProvider = .dropbox {
+        didSet { if provider != oldValue { defaults.set(provider.rawValue, forKey: "syncProvider") } }
+    }
     var biometricEnabled = false
     var toast: String?
     var errorMessage: String?
@@ -70,6 +92,24 @@ final class AppModel {
     /// Set after a successful import so the app can remind you to delete the plain-text file.
     var importedFile: URL?
 
+    /// Stops syncing without disconnecting the cloud. Everything stays on this device until you resume.
+    var syncPaused: Bool {
+        didSet {
+            defaults.set(syncPaused, forKey: "syncPaused")
+            if syncPaused {
+                syncTask?.cancel()
+                pollTask?.cancel()
+            } else if syncLinked, phase == .unlocked {
+                startPolling()
+                scheduleSync(delay: .milliseconds(200))
+            }
+        }
+    }
+
+    /// Look for each site's logo and keep it with the entry. The request goes to the site itself, nowhere else.
+    var autoLogos: Bool { didSet { defaults.set(autoLogos, forKey: "autoLogos") } }
+    var logosBusy = false
+
     var autoLockSeconds: Int { didSet { defaults.set(autoLockSeconds, forKey: "autoLockSeconds") } }
     var clipboardSeconds: Int { didSet { defaults.set(clipboardSeconds, forKey: "clipboardSeconds") } }
 
@@ -79,6 +119,7 @@ final class AppModel {
     let secrets: SecretStore
     let biometrics: BiometricKeyStore
     private(set) var dropbox: DropboxAuth
+    private(set) var google: GoogleAuth
     private(set) var session: VaultSession?
     private var engine: SyncEngine?
     private var lockTask: Task<Void, Never>?
@@ -91,6 +132,25 @@ final class AppModel {
 
     var dropboxConfigured: Bool { !dropboxAppKey.isEmpty }
     private(set) var dropboxAppKey: String
+    var googleConfigured: Bool { GoogleAuth.normalizedClientID(googleClientID) != nil }
+    private(set) var googleClientID: String
+
+    var cloudConfigured: Bool {
+        switch provider {
+        case .folder: true
+        case .dropbox: dropboxConfigured
+        case .googleDrive: googleConfigured
+        }
+    }
+    var syncLinked: Bool { isLinked(provider) }
+
+    func isLinked(_ p: CloudProvider) -> Bool {
+        switch p {
+        case .folder: folderLinked
+        case .dropbox: dropboxLinked
+        case .googleDrive: googleLinked
+        }
+    }
 
     init(storage: VaultStorage? = nil, secrets: SecretStore? = nil, biometrics: BiometricKeyStore? = nil) {
         let root = (try? VaultStorage.defaultRoot()) ?? FileManager.default.temporaryDirectory.appendingPathComponent("MyVault")
@@ -104,7 +164,13 @@ final class AppModel {
         let appKey = builtKey.isEmpty ? (UserDefaults.standard.string(forKey: "dropboxAppKey") ?? "") : builtKey
         self.dropboxAppKey = appKey
         self.dropbox = DropboxAuth(appKey: appKey, store: store)
+        let gid = UserDefaults.standard.string(forKey: "googleClientID") ?? ""
+        self.googleClientID = gid
+        self.google = GoogleAuth(clientID: gid, store: store)
         let d = UserDefaults.standard
+        self.provider = CloudProvider(rawValue: d.string(forKey: "syncProvider") ?? "") ?? .folder
+        self.syncPaused = d.bool(forKey: "syncPaused")
+        self.autoLogos = d.object(forKey: "autoLogos") as? Bool ?? true
         self.autoLockSeconds = d.object(forKey: "autoLockSeconds") as? Int ?? 60
         self.clipboardSeconds = d.object(forKey: "clipboardSeconds") as? Int ?? 30
     }
@@ -117,7 +183,11 @@ final class AppModel {
     func bootstrap() async {
         guard phase == .launching else { return }
         dropboxLinked = await dropbox.isLinked
-        syncStatus = dropboxLinked ? .idle : .notConfigured
+        googleLinked = await google.isLinked
+        // If the chosen cloud is not connected but the other one is, use the one that works.
+        restoreFolder()
+        if !syncLinked, let other = CloudProvider.allCases.first(where: { isLinked($0) }) { provider = other }
+        syncStatus = syncLinked ? .idle : .notConfigured
         refreshBiometricFlag()
         phase = storage.hasVault ? .locked : .setup
         if dropboxLinked { Task { dropboxEmail = await dropbox.accountEmail() } }
@@ -130,7 +200,9 @@ final class AppModel {
 
     private func refreshBiometricFlag() {
         guard let header = try? storage.loadHeader() else { biometricEnabled = false; return }
-        biometricEnabled = defaults.bool(forKey: bioKey(header.vaultID)) && biometrics.hasKey(vaultID: header.vaultID)
+        // Trust the saved setting. Asking the keychain whether the key is still there can itself trigger a second
+        // Face ID prompt; if the key was invalidated, the next real use finds out and falls back to the password.
+        biometricEnabled = defaults.bool(forKey: bioKey(header.vaultID))
     }
 
     // MARK: Create / unlock / lock
@@ -173,8 +245,14 @@ final class AppModel {
         return Date().timeIntervalSince(last) < Self.masterRecheckDays * 86_400
     }
 
+    private var biometricInFlight = false
+
     @discardableResult
     func unlockWithBiometrics() async -> Bool {
+        // One prompt at a time: a second request while Face ID is already open is ignored.
+        guard !biometricInFlight else { return false }
+        biometricInFlight = true
+        defer { biometricInFlight = false }
         guard biometricUnlockOffered, let header = try? storage.loadHeader() else {
             if biometricEnabled { unlockError = "For your security, enter your master password." }
             return false
@@ -201,6 +279,10 @@ final class AppModel {
     private func adopt(_ s: VaultSession, viaPassword: Bool) async {
         session = s
         engine = nil
+        if defaults.bool(forKey: "syncResetPending") {
+            try? await s.resetSyncState()
+            defaults.set(false, forKey: "syncResetPending")
+        }
         items = await s.allItems()
         lastSync = await s.lastSync
         if viaPassword { defaults.set(Date(), forKey: "lastMasterUnlock") }
@@ -211,7 +293,7 @@ final class AppModel {
         if unreadable > 0 {
             errorMessage = "\(unreadable) item(s) could not be read and were left untouched. They may be damaged. Syncing again may repair them."
         }
-        if dropboxLinked {
+        if syncLinked, !syncPaused {
             syncStatus = .idle
             startPolling()
             scheduleSync(delay: .milliseconds(300))
@@ -232,6 +314,20 @@ final class AppModel {
         importPreview = nil
         unlockError = nil
         if phase == .unlocked { phase = .locked }
+    }
+
+    /// For a forgotten master password: there is no recovery, so the only way forward is a new vault.
+    /// Deletes the vault on this device. Copies in the cloud are not touched.
+    func eraseVault() {
+        disableBiometrics()
+        lock()
+        try? storage.destroy()
+        defaults.removeObject(forKey: "lastMasterUnlock")
+        defaults.removeObject(forKey: "syncResetPending")
+        items = []
+        engine = nil
+        unlockError = nil
+        phase = .setup
     }
 
     // MARK: Biometrics
@@ -277,13 +373,73 @@ final class AppModel {
 
     func refresh() async {
         guard let session else { return }
-        items = await session.allItems()
+        let fresh = await session.allItems()
+        if fresh != items { items = fresh }
         selectFirstIfNeeded()
     }
 
     func save(_ item: VaultItem, select: Bool = true) {
         if select { selectedID = item.id }
         perform { try await $0.upsert(item) }
+        Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            await ensureIcon(for: item.id)
+        }
+    }
+
+    // MARK: Logos
+
+    private func needsIcon(_ item: VaultItem) -> Bool {
+        guard autoLogos, item.kind == .login, item.iconCustom != true, item.icon == nil, item.website != nil else { return false }
+        // A site that had no logo is not asked again for a month.
+        return item.iconCheckedAt.map { Date().timeIntervalSince($0) > 30 * 86_400 } ?? true
+    }
+
+    func ensureIcon(for id: UUID) async {
+        guard let session, let item = items.first(where: { $0.id == id }), needsIcon(item), let site = item.website else { return }
+        let data = await SiteIcon.fetch(website: site)
+        guard var fresh = await session.item(id), fresh.iconCustom != true, fresh.icon == nil else { return }
+        fresh.icon = data
+        fresh.iconCheckedAt = Date()
+        try? await session.upsert(fresh, touch: false)
+        await refresh()
+        scheduleSync()
+    }
+
+    /// Looks up the logo of every entry that has a website and no logo yet. A few at a time, in the background.
+    @discardableResult
+    func fetchMissingIcons() async -> (found: Int, tried: Int) {
+        guard let session, !logosBusy else { return (0, 0) }
+        let targets = items.filter(needsIcon)
+        guard !targets.isEmpty else { return (0, 0) }
+        logosBusy = true
+        defer { logosBusy = false }
+        var found = 0
+        var start = 0
+        while start < targets.count {
+            let chunk = Array(targets[start..<min(start + 4, targets.count)])
+            start += 4
+            let results = await withTaskGroup(of: (UUID, Data?).self) { group -> [(UUID, Data?)] in
+                for item in chunk {
+                    guard let site = item.website else { continue }
+                    group.addTask { (item.id, await SiteIcon.fetch(website: site)) }
+                }
+                var all = [(UUID, Data?)]()
+                for await r in group { all.append(r) }
+                return all
+            }
+            for (id, data) in results {
+                guard var fresh = await session.item(id), fresh.iconCustom != true, fresh.icon == nil else { continue }
+                fresh.icon = data
+                fresh.iconCheckedAt = Date()
+                try? await session.upsert(fresh, touch: false)
+                if data != nil { found += 1 }
+            }
+            if phase != .unlocked { break }
+        }
+        await refresh()
+        scheduleSync()
+        return (found, targets.count)
     }
 
     func delete(_ id: UUID) {
@@ -365,6 +521,17 @@ final class AppModel {
 
     func count(for nav: Nav) -> Int { items(for: nav).count }
 
+    /// The four counters of the iPhone home screen, in a single pass over the items.
+    var chipCounts: (all: Int, favorites: Int, logins: Int, cards: Int) {
+        var all = 0, favorites = 0, logins = 0, cards = 0
+        for item in items where !item.archived {
+            all += 1
+            if item.favorite { favorites += 1 }
+            if item.kind == .login { logins += 1 } else if item.kind == .card { cards += 1 }
+        }
+        return (all, favorites, logins, cards)
+    }
+
     var vaultNames: [String] {
         let names = Set(items.map(\.vault)).union(["Personal", "Work"])
         return names.sorted()
@@ -381,8 +548,16 @@ final class AppModel {
 
     // MARK: Sync
 
+    func makeRemote() -> RemoteStore {
+        switch provider {
+        case .folder: FolderRemoteStore(root: folderURL ?? URL(fileURLWithPath: "/nonexistent-safevault-folder"))
+        case .dropbox: DropboxRemoteStore(auth: dropbox)
+        case .googleDrive: GoogleDriveRemoteStore(auth: google)
+        }
+    }
+
     func scheduleSync(delay: Duration = .seconds(2)) {
-        guard dropboxLinked, phase == .unlocked, !demoMode else { return }
+        guard syncLinked, !syncPaused, phase == .unlocked, !demoMode else { return }
         syncTask?.cancel()
         syncTask = Task {
             try? await Task.sleep(for: delay)
@@ -403,9 +578,10 @@ final class AppModel {
     }
 
     func syncNow() async {
-        guard let session, dropboxLinked, !demoMode, syncStatus != .syncing else { return }
+        if syncPaused { syncPaused = false; return }
+        guard let session, syncLinked, !syncPaused, !demoMode, syncStatus != .syncing else { return }
         syncStatus = .syncing
-        let engine = self.engine ?? SyncEngine(session: session, remote: DropboxRemoteStore(auth: dropbox))
+        let engine = self.engine ?? SyncEngine(session: session, remote: makeRemote())
         self.engine = engine
         do {
             let report = try await engine.sync()
@@ -417,24 +593,70 @@ final class AppModel {
             }
         } catch RemoteError.offline {
             syncStatus = .offline
+        } catch RemoteError.quotaExceeded {
+            syncStatus = .quotaExceeded
         } catch RemoteError.unauthorized {
-            syncStatus = .failed("Dropbox needs you to sign in again.")
+            syncStatus = .failed("\(provider.title) needs you to sign in again.")
+        } catch VaultError.differentVault {
+            syncStatus = .failed("\(provider.title) already holds a different vault. In Settings, choose \"Use the vault from the cloud\" to bring it here, or \"Replace cloud copy with this vault\" to overwrite it.")
         } catch {
             syncStatus = .failed(error.localizedDescription)
         }
     }
 
     var syncDescription: String {
+        if syncLinked && syncPaused { return "Sync paused" }
         switch syncStatus {
-        case .notConfigured: return "Dropbox not connected"
-        case .idle: return "Synced with Dropbox"
-        case .syncing: return "Syncing with Dropbox…"
+        case .notConfigured: return "\(provider.title) not connected"
+        case .idle: return "Synced with \(provider.title)"
+        case .syncing: return "Syncing with \(provider.title)…"
         case .offline: return "Offline · will sync later"
+        case .quotaExceeded: return "\(provider.title) is full"
         case .failed: return "Sync problem"
         }
     }
 
-    func connectDropbox(authenticate: @escaping (URL, String) async throws -> URL) async {
+    /// Chooses which cloud keeps the encrypted copy. Everything is uploaded again to the new one; whatever is
+    /// already there is merged by the usual conflict rules, so nothing is lost and nothing is duplicated.
+    func selectProvider(_ new: CloudProvider) {
+        guard new != provider else { return }
+        provider = new
+        engine = nil
+        pollTask?.cancel()
+        syncTask?.cancel()
+        syncStatus = syncLinked ? .idle : .notConfigured
+        lastSync = nil
+        if let s = session {
+            Task {
+                try? await s.resetSyncState()
+                if syncLinked { startPolling(); scheduleSync(delay: .milliseconds(200)) }
+            }
+        } else if storage.hasVault {
+            defaults.set(true, forKey: "syncResetPending")  // applied the next time the vault is unlocked
+        }
+    }
+
+    func connectCloud(authenticate: @escaping (URL, String) async throws -> URL) async {
+        switch provider {
+        case .folder: break  // chosen with the folder picker, see linkFolder
+        case .dropbox: await connectDropbox(authenticate: authenticate)
+        case .googleDrive: await connectGoogle(authenticate: authenticate)
+        }
+    }
+
+    private func isCancelledLogin(_ error: Error) -> Bool {
+        (error as NSError).code == 1 && (error as NSError).domain == "com.apple.AuthenticationServices.WebAuthenticationSession"
+    }
+
+    private func finishConnecting() {
+        syncStatus = .idle
+        if phase == .unlocked {
+            startPolling()
+            scheduleSync(delay: .milliseconds(200))
+        }
+    }
+
+    private func connectDropbox(authenticate: @escaping (URL, String) async throws -> URL) async {
         guard dropboxConfigured else {
             errorMessage = "Paste your Dropbox app key in the \"One-time Dropbox setup\" box first, then press Connect Dropbox again."
             return
@@ -448,14 +670,31 @@ final class AppModel {
             guard let code = DropboxAuth.code(fromCallback: callback) else { throw RemoteError.unauthorized }
             try await dropbox.exchange(code: code, verifier: verifier)
             dropboxLinked = true
-            syncStatus = .idle
             dropboxEmail = await dropbox.accountEmail()
-            if phase == .unlocked {
-                startPolling()
-                scheduleSync(delay: .milliseconds(200))
-            }
+            finishConnecting()
         } catch {
-            if (error as NSError).code == 1, (error as NSError).domain == "com.apple.AuthenticationServices.WebAuthenticationSession" { return }  // cancelled
+            if isCancelledLogin(error) { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func connectGoogle(authenticate: @escaping (URL, String) async throws -> URL) async {
+        guard googleConfigured else {
+            errorMessage = "Paste your Google client ID in the \"One-time Google Drive setup\" box first, then press Connect Google Drive again."
+            return
+        }
+        busy = true
+        defer { busy = false }
+        let (verifier, challenge) = DropboxAuth.makePKCE()
+        guard let url = await google.authorizeURL(challenge: challenge) else { return }
+        do {
+            let callback = try await authenticate(url, await google.callbackScheme)
+            guard let code = GoogleAuth.code(fromCallback: callback) else { throw RemoteError.unauthorized }
+            try await google.exchange(code: code, verifier: verifier)
+            googleLinked = true
+            finishConnecting()
+        } catch {
+            if isCancelledLogin(error) { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -473,32 +712,193 @@ final class AppModel {
         dropboxAppKey = key
         dropbox = DropboxAuth(appKey: key, store: secrets)
         dropboxLinked = false
-        engine = nil
-        syncStatus = .notConfigured
+        if provider == .dropbox { engine = nil; syncStatus = .notConfigured }
         return true
     }
 
-    func disconnectDropbox() async {
-        await dropbox.unlink()
-        dropboxLinked = false
-        dropboxEmail = nil
+    /// Same for the Google OAuth client ID (an "iOS" type client, public, no secret).
+    @discardableResult
+    func saveGoogleClientID(_ raw: String) -> Bool {
+        guard let id = GoogleAuth.normalizedClientID(raw) else {
+            errorMessage = "That does not look like a Google client ID. It looks like 123456789-abc123.apps.googleusercontent.com."
+            return false
+        }
+        defaults.set(id, forKey: "googleClientID")
+        googleClientID = id
+        google = GoogleAuth(clientID: id, store: secrets)
+        googleLinked = false
+        if provider == .googleDrive { engine = nil; syncStatus = .notConfigured }
+        return true
+    }
+
+    // MARK: Folder (iCloud Drive)
+
+    #if os(macOS)
+    private static let bookmarkCreate: URL.BookmarkCreationOptions = [.withSecurityScope]
+    private static let bookmarkResolve: URL.BookmarkResolutionOptions = [.withSecurityScope]
+    #else
+    private static let bookmarkCreate: URL.BookmarkCreationOptions = []
+    private static let bookmarkResolve: URL.BookmarkResolutionOptions = []
+    #endif
+
+    /// Uses the folder you picked as the shared place for the encrypted files. The permission to use it is kept
+    /// (as a bookmark) so it still works after a restart.
+    func linkFolder(_ url: URL) async {
+        let scoped = url.startAccessingSecurityScopedResource()
+        do {
+            let probe = url.appendingPathComponent(".safevault-probe-\(UUID().uuidString)")
+            try Data("ok".utf8).write(to: probe)
+            try FileManager.default.removeItem(at: probe)
+            let bookmark = try url.bookmarkData(options: Self.bookmarkCreate, includingResourceValuesForKeys: nil, relativeTo: nil)
+            defaults.set(bookmark, forKey: "syncFolderBookmark")
+            stopFolderAccess()
+            folderURL = url
+            folderAccess = scoped
+            folderLinked = true
+            folderName = url.lastPathComponent
+            provider = .folder
+            engine = nil
+            finishConnecting()
+        } catch {
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            errorMessage = "SafeVault cannot save files in that folder. Pick another one, for example a new folder inside iCloud Drive. (\(error.localizedDescription))"
+        }
+    }
+
+    private func restoreFolder() {
+        guard let data = defaults.data(forKey: "syncFolderBookmark") else { return }
+        var stale = false
+        guard let url = try? URL(resolvingBookmarkData: data, options: Self.bookmarkResolve, relativeTo: nil, bookmarkDataIsStale: &stale) else { return }
+        folderAccess = url.startAccessingSecurityScopedResource()
+        folderURL = url
+        folderLinked = true
+        folderName = url.lastPathComponent
+        if stale, let fresh = try? url.bookmarkData(options: Self.bookmarkCreate, includingResourceValuesForKeys: nil, relativeTo: nil) {
+            defaults.set(fresh, forKey: "syncFolderBookmark")
+        }
+    }
+
+    private func stopFolderAccess() {
+        if folderAccess { folderURL?.stopAccessingSecurityScopedResource() }
+        folderAccess = false
+        folderURL = nil
+    }
+
+    /// Forgets the saved Dropbox app key / Google client ID (and the login made with it), so another one can be entered.
+    func forgetAppKey() async {
+        switch provider {
+        case .dropbox:
+            await dropbox.unlink()
+            defaults.removeObject(forKey: "dropboxAppKey")
+            dropboxAppKey = ""
+            dropbox = DropboxAuth(appKey: "", store: secrets)
+            dropboxLinked = false
+            dropboxEmail = nil
+        case .googleDrive:
+            await google.unlink()
+            defaults.removeObject(forKey: "googleClientID")
+            googleClientID = ""
+            google = GoogleAuth(clientID: "", store: secrets)
+            googleLinked = false
+        case .folder:
+            return
+        }
         syncStatus = .notConfigured
         engine = nil
         pollTask?.cancel()
     }
 
-    /// For a new device: fetches the vault header from Dropbox so the master password can unlock it.
-    func fetchVaultFromDropbox() async -> Bool {
+    /// Wipes SafeVault's files from the cloud and uploads this vault in their place. For when the cloud holds an old
+    /// vault whose password is lost. Only SafeVault's own files (vault.db, header.json, <uuid>.vitem) are touched.
+    func replaceCloudCopy() async {
+        guard syncLinked, let session else { return }
         busy = true
         defer { busy = false }
         do {
-            let remote = DropboxRemoteStore(auth: dropbox)
-            guard try await remote.listFiles().contains(where: { $0.name == VaultStorage.headerName }) else {
-                errorMessage = "There is no SafeVault in this Dropbox account yet. Create the vault on your other device first, or create a new one here."
+            let remote = makeRemote()
+            for file in try await remote.listFiles() where file.name == VaultFile.name || file.name == VaultStorage.headerName || VaultStorage.itemID(fromName: file.name) != nil {
+                try await remote.deleteFile(file.name)
+            }
+            engine = nil
+            try await session.resetSyncState()
+            syncStatus = .idle
+            await syncNow()
+            showToast("Cloud copy replaced")
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Replaces the vault on this device with the one stored in the cloud (for example the one made on the phone).
+    /// The cloud vault is checked first, so nothing is erased unless there is something to take its place.
+    func useCloudVault() async {
+        guard syncLinked else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            let remote = makeRemote()
+            let names = Set(try await remote.listFiles().map(\.name))
+            let header: Data
+            if names.contains(VaultFile.name) {
+                header = try VaultFile.headerData(from: try await remote.download(VaultFile.name).data)
+            } else if names.contains(VaultStorage.headerName) {
+                header = try await remote.download(VaultStorage.headerName).data
+            } else {
+                errorMessage = "There is no SafeVault vault in this \(provider.title) yet, so there is nothing to bring here."
+                return
+            }
+            // Something is there: now it is safe to replace the vault on this device.
+            disableBiometrics()
+            lock()
+            try? storage.destroy()
+            for key in ["lastMasterUnlock", "syncResetPending"] { defaults.removeObject(forKey: key) }
+            items = []
+            engine = nil
+            try storage.installDownloadedHeader(header)
+            syncStatus = .idle
+            phase = .locked
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func disconnectCloud() async {
+        switch provider {
+        case .dropbox:
+            await dropbox.unlink()
+            dropboxLinked = false
+            dropboxEmail = nil
+        case .googleDrive:
+            await google.unlink()
+            googleLinked = false
+        case .folder:
+            stopFolderAccess()
+            defaults.removeObject(forKey: "syncFolderBookmark")
+            folderLinked = false
+            folderName = nil
+        }
+        syncStatus = .notConfigured
+        engine = nil
+        pollTask?.cancel()
+    }
+
+    /// For a new device: fetches the vault header from the chosen cloud so the master password can unlock it.
+    func fetchVaultFromCloud() async -> Bool {
+        busy = true
+        defer { busy = false }
+        do {
+            let remote = makeRemote()
+            let names = Set(try await remote.listFiles().map(\.name))
+            guard names.contains(VaultFile.name) || names.contains(VaultStorage.headerName) else {
+                errorMessage = "There is no SafeVault in this \(provider.title) account yet. Create the vault on your other device first, or create a new one here."
                 return false
             }
-            let (data, _) = try await remote.download(VaultStorage.headerName)
-            try storage.installDownloadedHeader(data)
+            if names.contains(VaultFile.name) {
+                let file = try await remote.download(VaultFile.name).data
+                try storage.installDownloadedHeader(try VaultFile.headerData(from: file))
+            } else {  // a vault left by an older version, in one file per item
+                try storage.installDownloadedHeader(try await remote.download(VaultStorage.headerName).data)
+            }
             phase = .locked
             return true
         } catch {
@@ -558,6 +958,7 @@ final class AppModel {
             await refresh()
             scheduleSync(delay: .milliseconds(500))
             showToast("Imported \(preview.unique.count) items")
+            Task { _ = await fetchMissingIcons() }
             if preview.deletable { importedFile = preview.url }
         } catch {
             errorMessage = error.localizedDescription
