@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "SafeVault",
+  "version": "0.1.0",
+  "description": "Fill your SafeVault logins in Chrome. Read-only: your vault is decrypted locally with your master password.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvMoqrv22nfeNM6LF4bbv+nHfjOMjj0lonvWTfAJBAIrdhVB0Mkds4qbyTU0iaNy69OoSvrWBfrHLAxb1JizPj5F1HGAlCOCTdjfYJUuLSYIUFsobcYN9iE1CDucRnoqjthslL3ODb7+d/PaZmDSv+7/zrya6ZqKxSXzYtjzpo3agqHxFO+3l5GPux049+aNdbYD32HmswERLXk1ka6gdFXGzT4ShNYOXibDYlYi1J/9ub3eDjflddnjyih6AMkNsH6S93SFe5Zu+Zx5KA/BAlDXFkea/GM5nxg+fSuL8t2PlmWncUrkz5Ng6+lf4vSJlHZEHJmDzkBAPhbUN8nfBKQIDAQAB",
+  "minimum_chrome_version": "116",
+  "action": { "default_title": "SafeVault", "default_popup": "popup.html", "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" } },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "background": { "service_worker": "src/background.js", "type": "module" },
+  "permissions": ["storage", "alarms", "identity", "activeTab", "scripting"],
+  "host_permissions": ["https://api.dropboxapi.com/*", "https://content.dropboxapi.com/*"],
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'; base-uri 'none'; connect-src https://api.dropboxapi.com https://content.dropboxapi.com" }
+}

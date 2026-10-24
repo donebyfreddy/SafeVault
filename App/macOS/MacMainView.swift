@@ -16,8 +16,14 @@ struct MacMainView: View {
         } detail: {
             DetailColumn()
         }
-        .navigationTitle("SafeVault")
+        .navigationTitle("")
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                HStack(spacing: 8) {
+                    AppMark(size: 26)
+                    Text("SafeVault").font(.system(size: 16, weight: .bold)).tracking(-0.3)
+                }
+            }
             ToolbarItemGroup(placement: .primaryAction) {
                 Menu {
                     ForEach(ItemKind.allCases, id: \.self) { kind in
@@ -32,6 +38,7 @@ struct MacMainView: View {
             }
         }
         .sheet(item: $editingNew) { EditItemView(item: $0, isNew: true) }
+        .overlay(alignment: .bottomTrailing) { ExtensionPrompt() }
         .onChange(of: model.newItemRequest) { _, kind in
             guard let kind else { return }
             editingNew = model.newItem(kind: kind)
