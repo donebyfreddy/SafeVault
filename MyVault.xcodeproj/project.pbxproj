@@ -26,6 +26,7 @@
 		B9F3D5E1B979217A79563BA5 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 6AB36A28104D87185D37B2C8 /* Assets.xcassets */; };
 		BC41385614D019136D610E98 /* DemoData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6599FF9D76ED36E8F25ACA02 /* DemoData.swift */; };
 		BD6F46B8585D23898A1D9057 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D962E244D508C84D5219A89 /* AppModel.swift */; };
+		C6D98ADDBCFE4209F9453D4F /* ExtensionPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38A7098167B18C4F8BC12B39 /* ExtensionPrompt.swift */; };
 		C7E81AB687AD8B0F9AE7BB22 /* Entry.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFF049BB2BAFAE508A1742EB /* Entry.swift */; };
 		CF7C1D2A96260F585C7541FA /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D962E244D508C84D5219A89 /* AppModel.swift */; };
 		CFB9658C6C70DED20EBBCA03 /* ItemViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CD3FD3DF92AFAB675CD8C5B /* ItemViews.swift */; };
@@ -34,6 +35,7 @@
 /* Begin PBXFileReference section */
 		0E41814FB85C93231D9E4C46 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		22D330FC21B2575CC6C66126 /* Grouping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Grouping.swift; sourceTree = "<group>"; };
+		38A7098167B18C4F8BC12B39 /* ExtensionPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionPrompt.swift; sourceTree = "<group>"; };
 		4CD3FD3DF92AFAB675CD8C5B /* ItemViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ItemViews.swift; sourceTree = "<group>"; };
 		4D962E244D508C84D5219A89 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		577B2B46A132E578A3A3AB5C /* EditItemView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditItemView.swift; sourceTree = "<group>"; };
@@ -89,6 +91,7 @@
 		514F10B2F0C571C944BCAF20 /* macOS */ = {
 			isa = PBXGroup;
 			children = (
+				38A7098167B18C4F8BC12B39 /* ExtensionPrompt.swift */,
 				E1047204347DF2FEE74DA7E4 /* MacMainView.swift */,
 			);
 			path = macOS;
@@ -249,6 +252,7 @@
 				1969B06C218D987A843ABCF7 /* DemoData.swift in Sources */,
 				9E07E06EBEC239B276A9C659 /* EditItemView.swift in Sources */,
 				C7E81AB687AD8B0F9AE7BB22 /* Entry.swift in Sources */,
+				C6D98ADDBCFE4209F9453D4F /* ExtensionPrompt.swift in Sources */,
 				6245C9A90865444179CE3FF6 /* Grouping.swift in Sources */,
 				0017433C56F8322A0128D7A5 /* ItemViews.swift in Sources */,
 				3E23D5D4413B156A923A618E /* MacMainView.swift in Sources */,

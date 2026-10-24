@@ -32,7 +32,7 @@ struct RootView: View {
         .task { await model.bootstrap() }
         .onChange(of: scenePhase) { _, new in
             #if os(iOS)
-            if new == .background { model.appLeft() }
+            if new == .background { model.biometricAttempted = false; model.appLeft() }
             if new == .active { model.appReturned() }
             #endif
         }
@@ -42,6 +42,15 @@ struct RootView: View {
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in model.lock() }
         .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name("com.apple.screenIsLocked"))) { _ in model.lock() }
         #endif
+        .alert(
+            "Unlock with \(model.biometryName)?",
+            isPresented: $model.offerBiometrics
+        ) {
+            Button("Turn On") { Task { await model.enableBiometrics() } }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text("Open SafeVault with \(model.biometryName) instead of typing your master password. You can change this in Settings.")
+        }
         .alert(
             "Something went wrong",
             isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })
@@ -113,6 +122,7 @@ struct ToastView: View {
 
 struct LockView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     @State private var password = ""
     @State private var confirmErase = false
     @FocusState private var focused: Bool
@@ -191,9 +201,11 @@ struct LockView: View {
         } message: {
             Text("A forgotten master password cannot be recovered by anyone. This deletes the vault on this device so you can create a new one. Copies in your cloud are not touched, and passwords you still have in Safe can be imported again.")
         }
-        .task {
+        .task(id: scenePhase) {
+            // Only while the app is on screen, and only once per visit to the lock screen.
+            guard scenePhase == .active else { return }
             guard !model.demoMode, model.biometricUnlockOffered else { focused = true; return }
-            await model.unlockWithBiometrics()
+            await model.autoUnlockIfNeeded()
         }
     }
 

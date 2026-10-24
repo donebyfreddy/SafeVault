@@ -100,6 +100,9 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
     public var iconCustom: Bool?
     /// When the site's logo was last looked for, so a site without one is not asked again and again.
     public var iconCheckedAt: Date?
+    /// A symbol (SF Symbol name) and/or colour (0xRRGGBB) chosen for the tile, instead of a logo.
+    public var tileSymbol: String?
+    public var tileColor: UInt32?
 
     public static let maxHistory = 20
 
@@ -123,7 +126,9 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
         deleted: Bool = false,
         icon: Data? = nil,
         iconCustom: Bool? = nil,
-        iconCheckedAt: Date? = nil
+        iconCheckedAt: Date? = nil,
+        tileSymbol: String? = nil,
+        tileColor: UInt32? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -145,6 +150,8 @@ public struct VaultItem: Codable, Hashable, Identifiable, Sendable {
         self.icon = icon
         self.iconCustom = iconCustom
         self.iconCheckedAt = iconCheckedAt
+        self.tileSymbol = tileSymbol
+        self.tileColor = tileColor
     }
 
     // MARK: Convenience

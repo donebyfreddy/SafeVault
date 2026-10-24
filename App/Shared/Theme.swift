@@ -141,24 +141,18 @@ struct ShieldKeyholeShape: Shape {
     }
 }
 
+/// The app's own icon (your photo with the shield badge), so the lock screen matches the Home Screen.
 struct AppMark: View {
     var size: CGFloat = 28
 
     var body: some View {
-        RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
-            .fill(VT.appGradient)
+        Image("AppLogo")
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
             .frame(width: size, height: size)
-            .overlay(
-                RoundedRectangle(cornerRadius: size * 0.27, style: .continuous)
-                    .strokeBorder(LinearGradient(colors: [.white.opacity(0.35), .clear], startPoint: .top, endPoint: .bottom), lineWidth: max(1, size * 0.012))
-            )
-            .overlay(
-                ShieldKeyholeShape()
-                    .fill(.white, style: FillStyle(eoFill: true))
-                    .frame(width: size * 0.62, height: size * 0.62)
-                    .shadow(color: Color(hex: 0x1B3FA8, opacity: 0.35), radius: size * 0.03, y: size * 0.02)
-            )
-            .shadow(color: VT.blue.opacity(size > 40 ? 0.35 : 0), radius: size * 0.2, y: size * 0.1)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.225, style: .continuous))
+            .shadow(color: VT.blue.opacity(size > 40 ? 0.3 : 0), radius: size * 0.2, y: size * 0.1)
             .accessibilityHidden(true)
     }
 }
@@ -287,10 +281,27 @@ struct ServiceTile: View {
     var kind: ItemKind = .login
     /// The site's logo or the one you chose. Takes the place of the generic tile.
     var icon: Data? = nil
+    /// A symbol and/or colour picked by the user; they win over any logo.
+    var symbol: String? = nil
+    var color: UInt32? = nil
     var size: CGFloat = 40
 
     var body: some View {
-        if let icon, let image = logoImage(icon) {
+        if symbol != nil || color != nil {
+            let c = Color(hex: color ?? 0x2F73F2)
+            RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
+                .fill(c)
+                .overlay {
+                    if let symbol {
+                        Image(systemName: symbol).font(.system(size: size * 0.46, weight: .semibold)).foregroundStyle(.white)
+                    } else {
+                        Text(String(name.trimmingCharacters(in: .whitespaces).first.map { Character($0.uppercased()) } ?? "?"))
+                            .font(.system(size: size * 0.5, weight: .bold, design: .rounded)).foregroundStyle(.white)
+                    }
+                }
+                .frame(width: size, height: size)
+                .accessibilityHidden(true)
+        } else if let icon, let image = logoImage(icon) {
             image
                 .resizable()
                 .interpolation(.high)

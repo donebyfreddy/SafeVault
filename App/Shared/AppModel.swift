@@ -1,4 +1,5 @@
 import MyVaultKit
+import Network
 import Observation
 import SwiftUI
 
@@ -75,6 +76,8 @@ final class AppModel {
         didSet { if provider != oldValue { defaults.set(provider.rawValue, forKey: "syncProvider") } }
     }
     var biometricEnabled = false
+    /// Set after a password unlock when Face ID / Touch ID could be switched on; the root view asks once.
+    var offerBiometrics = false
     var toast: String?
     var errorMessage: String?
     var unlockError: String?
@@ -246,6 +249,15 @@ final class AppModel {
     }
 
     private var biometricInFlight = false
+    /// True once Face ID / Touch ID was shown for this visit to the lock screen; reset when the app leaves or locks.
+    var biometricAttempted = false
+
+    /// Shows Face ID / Touch ID by itself, once per visit to the lock screen.
+    func autoUnlockIfNeeded() async {
+        guard phase == .locked, !biometricAttempted, biometricUnlockOffered else { return }
+        biometricAttempted = true
+        await unlockWithBiometrics()
+    }
 
     @discardableResult
     func unlockWithBiometrics() async -> Bool {
@@ -288,6 +300,11 @@ final class AppModel {
         if viaPassword { defaults.set(Date(), forKey: "lastMasterUnlock") }
         refreshBiometricFlag()
         phase = .unlocked
+        if viaPassword, !biometricEnabled, biometrics.isAvailable, !demoMode,
+           let vid = (try? storage.loadHeader())?.vaultID, !defaults.bool(forKey: "biometricAsked.\(vid.uuidString.lowercased())") {
+            defaults.set(true, forKey: "biometricAsked.\(vid.uuidString.lowercased())")
+            offerBiometrics = true
+        }
         selectFirstIfNeeded()
         let unreadable = await s.unreadableItems.count
         if unreadable > 0 {
@@ -301,6 +318,7 @@ final class AppModel {
     }
 
     func lock() {
+        biometricAttempted = false
         lockTask?.cancel()
         syncTask?.cancel()
         pollTask?.cancel()
@@ -390,7 +408,7 @@ final class AppModel {
     // MARK: Logos
 
     private func needsIcon(_ item: VaultItem) -> Bool {
-        guard autoLogos, item.kind == .login, item.iconCustom != true, item.icon == nil, item.website != nil else { return false }
+        guard autoLogos, item.kind == .login, item.iconCustom != true, item.icon == nil, item.tileSymbol == nil, item.tileColor == nil, item.website != nil else { return false }
         // A site that had no logo is not asked again for a month.
         return item.iconCheckedAt.map { Date().timeIntervalSince($0) > 30 * 86_400 } ?? true
     }
@@ -556,7 +574,7 @@ final class AppModel {
         }
     }
 
-    func scheduleSync(delay: Duration = .seconds(2)) {
+    func scheduleSync(delay: Duration = .milliseconds(400)) {
         guard syncLinked, !syncPaused, phase == .unlocked, !demoMode else { return }
         syncTask?.cancel()
         syncTask = Task {
@@ -566,7 +584,48 @@ final class AppModel {
         }
     }
 
+    private var syncAgain = false
+    private var networkMonitor: NWPathMonitor?
+
+    /// When the connection comes back, anything waiting is sent at once.
+    private func watchNetwork() {
+        guard networkMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.phase == .unlocked else { return }
+                switch self.syncStatus {
+                case .offline, .failed: self.scheduleSync(delay: .seconds(1))
+                default: break
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "safevault.network"))
+        networkMonitor = monitor
+    }
+
+    /// Sends pending changes right now; on iPhone the system is asked for a little extra time to finish.
+    private func syncBeforeLeaving() {
+        guard syncLinked, !syncPaused, phase == .unlocked, !demoMode else { return }
+        syncTask?.cancel()
+        #if os(iOS)
+        var bg = UIBackgroundTaskIdentifier.invalid
+        bg = UIApplication.shared.beginBackgroundTask(withName: "SafeVault sync") {
+            UIApplication.shared.endBackgroundTask(bg)
+            bg = .invalid
+        }
+        Task {
+            await syncNow()
+            if bg != .invalid { UIApplication.shared.endBackgroundTask(bg); bg = .invalid }
+        }
+        #else
+        Task { await syncNow() }
+        #endif
+    }
+
     private func startPolling() {
+        watchNetwork()
         pollTask?.cancel()
         pollTask = Task {
             while !Task.isCancelled {
@@ -579,7 +638,10 @@ final class AppModel {
 
     func syncNow() async {
         if syncPaused { syncPaused = false; return }
-        guard let session, syncLinked, !syncPaused, !demoMode, syncStatus != .syncing else { return }
+        guard let session, syncLinked, !syncPaused, !demoMode else { return }
+        // A change made while a sync is running is picked up by one more round right after it.
+        if syncStatus == .syncing { syncAgain = true; return }
+        defer { if syncAgain { syncAgain = false; scheduleSync(delay: .milliseconds(100)) } }
         syncStatus = .syncing
         let engine = self.engine ?? SyncEngine(session: session, remote: makeRemote())
         self.engine = engine
@@ -1024,6 +1086,7 @@ final class AppModel {
 
     func appLeft() {
         guard phase == .unlocked else { return }
+        syncBeforeLeaving()
         if leftAt == nil { leftAt = Date() }
         lockTask?.cancel()
         let seconds = autoLockSeconds

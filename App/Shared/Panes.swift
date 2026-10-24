@@ -144,7 +144,7 @@ struct SecurityCenterView: View {
                                 #endif
                             } label: {
                                 HStack(spacing: 12) {
-                                    ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: 34)
+                                    ServiceTile(name: item.name, kind: item.kind, icon: item.icon, symbol: item.tileSymbol, color: item.tileColor, size: 34)
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(item.name).font(.system(size: 14, weight: .semibold)).foregroundStyle(VT.ink)
                                         Text(item.subtitle).font(.system(size: 12)).foregroundStyle(VT.ink3)

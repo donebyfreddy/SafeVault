@@ -97,7 +97,10 @@ struct PhoneHome: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text("SafeVault").font(.system(size: 32, weight: .bold)).tracking(-0.9)
+                    HStack(spacing: 10) {
+                        AppMark(size: 36)
+                        Text("SafeVault").font(.system(size: 30, weight: .bold)).tracking(-0.9)
+                    }
                     Spacer()
                     Menu {
                         ForEach(ItemKind.allCases, id: \.self) { kind in
@@ -214,7 +217,7 @@ struct PhoneHome: View {
                         if i > 0 { Divider().overlay(VT.line).padding(.leading, 58) }
                         NavigationLink(value: item.id) {
                             HStack(spacing: 12) {
-                                ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: 34)
+                                ServiceTile(name: item.name, kind: item.kind, icon: item.icon, symbol: item.tileSymbol, color: item.tileColor, size: 34)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name).font(.system(size: 14.5, weight: .semibold)).foregroundStyle(VT.ink).lineLimit(1)
                                     Text(item.subtitle).font(.system(size: 12)).foregroundStyle(VT.ink3).lineLimit(1)

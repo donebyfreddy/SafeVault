@@ -10,7 +10,7 @@ struct ItemRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: 38)
+            ServiceTile(name: item.name, kind: item.kind, icon: item.icon, symbol: item.tileSymbol, color: item.tileColor, size: 38)
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.name.isEmpty ? "Untitled" : item.name)
                     .font(.system(size: 14, weight: .semibold))
@@ -89,7 +89,7 @@ struct ItemDetailView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 16) {
-            ServiceTile(name: item.name, kind: item.kind, icon: item.icon, size: compact ? 56 : 64)
+            ServiceTile(name: item.name, kind: item.kind, icon: item.icon, symbol: item.tileSymbol, color: item.tileColor, size: compact ? 56 : 64)
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Text(item.name)
